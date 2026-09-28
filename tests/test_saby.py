@@ -14,7 +14,7 @@ def test_catalog_pages_and_categories():
         return {'nomenclatures':[{'id':3,'name':'Весовой','unit':'кг','cost':100}, {'id':4,'name':'Сухарики','unit':'шт','cost':50,'hierarchicalParent':1}], 'outcome':False}
     api.call=call
     rows=asyncio.run(api.catalog({'point_id':10,'price_list_id':20}))
-    assert len(rows)==2 and rows[0]['price']==14990 and rows[0]['category']=='Снеки'
+    assert len(rows)==3 and rows[0]['price']==14990 and rows[0]['category']=='Снеки'
     assert calls[1]['position']==2
     assert all(p['priceListId']==20 for p in calls)
 

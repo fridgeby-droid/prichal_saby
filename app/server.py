@@ -5,13 +5,14 @@ from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from .products import line_item
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .integrations import Saby, YooKassa, telegram, TZ, IntegrationError
 
 ROOT=Path(__file__).resolve().parent.parent
-MODE=os.getenv('APP_MODE','demo')
+MODE=os.getenv('APP_MODE','demo').strip().strip("\"'").lower()
 DEMO=MODE=='demo'
 CATALOG_ONLY=MODE=='catalog'
 BASE=os.getenv('PUBLIC_URL','http://localhost:8000').rstrip('/')
@@ -69,7 +70,7 @@ def view(o):
     keys=('id','store_id','name','phone','address','slot','amount','status','payment_status','created','payment_url')
     d={k:o.get(k) for k in keys}; d['status_label']=LABELS[o['status']]
     d['store']=store_for(o['store_id'])['name']
-    d['items']=[{k:i[k] for k in ('id','name','qty','price')} for i in o['items']]
+    d['items']=[{k:i.get(k) for k in ('id','name','qty','price','unit','selection','line_amount','weighted')} for i in o['items']]
     return d
 
 async def user(request:Request):
@@ -187,7 +188,7 @@ async def lifespan(app):
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.2.0',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.3.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -214,12 +215,19 @@ async def health(): return {'ok':True,'mode':MODE}
 async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in STORES],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
 async def get_catalog(sid:str,uid=Depends(user)): return [{k:v for k,v in p.items() if k!='saby'} for p in await catalog(store_for(sid))]
+@app.get('/api/product-image/{key}')
+async def product_image(key:str):
+    path=SABY.images.get(key)
+    if not path: raise HTTPException(404,'Фото отсутствует; обновите каталог')
+    content,mime=await SABY.call('GET',path,binary=True)
+    return Response(content,media_type=mime)
+
 @app.get('/api/slots/{sid}')
 async def get_slots(sid:str,uid=Depends(user)): return await slots(store_for(sid))
 
 class Item(BaseModel):
     id:str=Field(max_length=128)
-    qty:int=Field(ge=1,le=30)
+    qty:int=Field(ge=1,le=30000)
 class Checkout(BaseModel):
     store_id:str=Field(max_length=80)
     name:str=Field(min_length=2,max_length=80)
@@ -242,9 +250,10 @@ async def checkout(body:Checkout,uid=Depends(user)):
         items=[]
         for item in body.items:
             p=products.get(item.id)
-            if not p or (p['stock'] is not None and item.qty>p['stock']): raise HTTPException(409,'Товар закончился или изменился остаток. Обновите корзину')
-            items.append({**p,'qty':item.qty})
-        amount=sum(i['price']*i['qty'] for i in items)
+            if not p: raise HTTPException(409,'Товар больше недоступен')
+            try: items.append(line_item(p,item.qty))
+            except ValueError as exc: raise HTTPException(409,str(exc))
+        amount=sum(i['line_amount'] for i in items)
         if amount<=0 or amount>10000000: raise HTTPException(400,'Недопустимая сумма')
         o={'id':str(uuid.uuid4()),'user_id':uid,'store_id':s['id'],'name':body.name.strip(),'phone':body.phone,
            'address':body.address,'slot':body.slot,'items':items,'amount':amount,'created':time.time(),

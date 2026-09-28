@@ -1,5 +1,6 @@
 """External adapters. No external writes in demo mode."""
-import os, json, uuid, asyncio
+import os, json, uuid, asyncio, hashlib
+from .products import rules, description, image_path
 from datetime import datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -9,8 +10,9 @@ TZ = ZoneInfo('Asia/Yekaterinburg')
 class IntegrationError(Exception): pass
 
 class Saby:
-    def __init__(self): self.token = None; self.auth_lock = asyncio.Lock()
+    def __init__(self): self.token = None; self.auth_lock = asyncio.Lock(); self.images = {}
     async def call(self, method, path, **kwargs):
+        binary=kwargs.pop("binary",False)
         async with httpx.AsyncClient(timeout=25) as c:
             for attempt in range(2):
                 async with self.auth_lock:
@@ -30,6 +32,11 @@ class Saby:
                     if self.token == used_token: self.token = None
                     if method == 'GET' and attempt == 0: continue
                 if r.is_error: raise IntegrationError(f'Saby: {path}, HTTP {r.status_code}. Проверьте права API и настройки точки.')
+                if binary:
+                    mime=r.headers.get("content-type", "").split(";")[0]
+                    if mime not in ("image/jpeg","image/png","image/webp","image/gif") or len(r.content)>8*1024*1024:
+                        raise IntegrationError("Неподдерживаемый формат или размер фото")
+                    return r.content,mime
                 data = r.json()
                 if isinstance(data,dict) and data.get('error'): raise IntegrationError('Ошибка API Saby')
                 return data
@@ -95,11 +102,19 @@ class Saby:
                     continue
                 if p.get('published') is False: continue
                 if p.get('cost') is None: continue
-                # v0.1 supports packaged goods. Do not sell loose-weight units as pieces.
                 unit=p.get('unit') or ''
-                if unit.lower().rstrip('.') not in ('шт','штука','упак','уп'): continue
+                quantity_rules=rules(unit)
+                if not quantity_rules: continue
+                photos=[]
+                for value in p.get('images') or []:
+                    path=image_path(value)
+                    if path:
+                        key=hashlib.sha256(path.encode()).hexdigest()
+                        self.images[key]=path
+                        photos.append('/api/product-image/'+key)
                 rows.append({'id':str(p.get('externalId') or p.get('id')), 'name':p['name'],
-                    'price':int(Decimal(str(p['cost']))*100), 'stock':None if p.get('balance') is None else max(0,int(Decimal(str(p['balance'])))),
+                    'price':int(Decimal(str(p['cost']))*100), 'stock':None if p.get('balance') is None else max(0,float(Decimal(str(p['balance'])))),
+                    'description':description(p.get('description')),'images':photos,**quantity_rules,
                     'category':'Каталог','parent':str(p.get('hierarchicalParent')),'unit':unit, 'icon':'◈',
                     'saby':{k:p[k] for k in ('externalId','id','nomNumber','hierarchicalId') if p.get(k) is not None}})
             outcome=result.get('outcome') if isinstance(result,dict) else None
@@ -139,6 +154,7 @@ class Saby:
 
 class YooKassa:
     async def call(self, method, path, **kwargs):
+        binary=kwargs.pop("binary",False)
         async with httpx.AsyncClient(timeout=25,auth=(os.getenv('YOOKASSA_SHOP_ID',''),os.getenv('YOOKASSA_SECRET_KEY',''))) as c:
             r=await c.request(method,'https://api.yookassa.ru/v3/'+path,**kwargs)
             r.raise_for_status()
