@@ -13,6 +13,7 @@ async def main():
     sub.add_parser('saby-points')
     t=sub.add_parser('saby-prices');t.add_argument('point_id',type=int)
     sub.add_parser('saby-check')
+    t=sub.add_parser('saby-photos');t.add_argument('--name',default='');t.add_argument('--limit',type=int,default=5)
     t=sub.add_parser('saby-state');t.add_argument('external_id')
     t=sub.add_parser('attach-saby');t.add_argument('order_id');t.add_argument('external_id')
     t=sub.add_parser('retry-saby');t.add_argument('order_id');t.add_argument('--confirmed-absent',action='store_true',required=True)
@@ -21,6 +22,21 @@ async def main():
         print(json.dumps(await s.SABY.points(),ensure_ascii=False,indent=2))
     elif args.command=='saby-prices':
         print(json.dumps(await s.SABY.prices(args.point_id),ensure_ascii=False,indent=2))
+    elif args.command=='saby-photos':
+        from app.integrations import IntegrationError
+        for store in await s.SABY.configured_stores():
+            products=await s.SABY.catalog(store)
+            selected=[p for p in products if args.name.lower() in p['name'].lower()][:max(1,min(args.limit,20))]
+            for p in selected:
+                result={'store':store['name'],'product':p['name'],'images_field_type':p.get('photo_format'),'source_count':p.get('photo_count'),'recognized':len(p.get('images',[]))}
+                if p.get('images'):
+                    key=p['images'][0].rsplit('/',1)[-1]
+                    try:
+                        data,mime=await s.SABY.call('GET',s.SABY.images[key],binary=True)
+                        result.update(status='OK',format=mime,bytes=len(data))
+                    except IntegrationError as exc: result['error']=str(exc)
+                else: result['status']='Saby не вернул поддерживаемую ссылку на фото'
+                print(json.dumps(result,ensure_ascii=False))
     elif args.command=='saby-check':
         for store in await s.SABY.configured_stores():
             goods=await s.SABY.catalog(store)

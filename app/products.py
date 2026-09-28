@@ -1,6 +1,7 @@
 """Quantity rules: the cart uses grams for weight goods, pieces otherwise."""
 from decimal import Decimal, ROUND_HALF_UP
 from html.parser import HTMLParser
+from html import unescape
 from urllib.parse import urljoin, urlsplit
 
 class PlainText(HTMLParser):
@@ -18,9 +19,13 @@ def description(value):
     return '\n'.join(x.strip() for x in ''.join(parser.parts).splitlines() if x.strip())[:10000]
 
 def image_path(value):
+    if isinstance(value,dict): value=value.get('url') or value.get('href') or value.get('src')
     if not isinstance(value,str): return None
+    value=unescape(value.strip())
+    if value.startswith('/img?'): value=value[1:]
+    if value.startswith('retail/'): value='/'+value
     url=urlsplit(urljoin('https://api.sbis.ru/retail/',value))
-    if url.scheme!='https' or url.netloc!='api.sbis.ru' or url.path!='/retail/img' or url.fragment: return None
+    if url.scheme!='https' or url.netloc!='api.sbis.ru' or url.path.rstrip('/')!='/retail/img' or url.fragment: return None
     return 'img'+('?' + url.query if url.query else '')
 
 def rules(unit):
