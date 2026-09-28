@@ -1,0 +1,4 @@
+[
+  {"id":"center","name":"Причал · Центр","address":"Демонстрационный магазин №1","point_id":0,"price_list_id":0,"chat_id":0,"staff_ids":[],"lat":58.01,"lon":56.25},
+  {"id":"district","name":"Причал · У дома","address":"Демонстрационный магазин №2","point_id":0,"price_list_id":0,"chat_id":0,"staff_ids":[],"lat":58.03,"lon":56.28}
+]
