@@ -110,7 +110,15 @@ def demo_catalog(sid):
       ('lemonade','Лимонад, 0,5 л',11900,'Напитки','◉'),('water','Вода, 0,5 л',5900,'Напитки','◌')]
     return [{'id':a,'name':b,'price':c,'category':d,'icon':e,'unit':'шт','stock':20 if sid=='center' else 12,'saby':{'nomNumber':a}} for a,b,c,d,e in goods]
 async def catalog(s,checkout=False): return demo_catalog(s['id']) if DEMO else CACHE.products(s,checkout)
+def test_auto_time():
+    enabled=os.getenv('TEST_AUTO_PICKUP_TIME','false').lower()=='true'
+    if enabled and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or
+                    (not DEMO and not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_'))):
+        raise RuntimeError('TEST_AUTO_PICKUP_TIME разрешён только с тестовым ключом ЮKassa и ALLOW_REAL_PAYMENTS=false')
+    return enabled
+
 async def slots(s):
+    if test_auto_time(): return []
     if not DEMO: return await SABY.slots(s)
     now=datetime.now(TZ); first=now.replace(second=0,microsecond=0)+timedelta(minutes=30-now.minute%30)
     return [(first+timedelta(minutes=30*n)).strftime('%Y-%m-%d %H:%M:%S') for n in range(1,17)]
@@ -118,6 +126,7 @@ async def slots(s):
 async def reconcile_payment(o,p):
     if p.get('id')!=o.get('payment_id') or p.get('metadata',{}).get('order_id')!=o['id']: raise HTTPException(400,'Платёж не соответствует заказу')
     if p.get('amount',{}).get('currency')!='RUB' or Decimal(p['amount']['value'])*100!=o['amount']: raise HTTPException(400,'Сумма платежа не соответствует заказу')
+    if o.get('test_auto_time') and not p.get('test',False): raise HTTPException(409,'Этот заказ предназначен только для тестовой оплаты')
     if not p.get('test',False) and os.getenv('ALLOW_REAL_PAYMENTS')!='true': raise HTTPException(409,'Реальные платежи отключены')
     if o['payment_status']=='succeeded': return
     if p['status']=='succeeded':
@@ -192,6 +201,7 @@ async def lifespan(app):
         if os.getenv('ALLOW_REAL_PAYMENTS')=='true' and os.getenv('LIVE_ACCEPTANCE_CONFIRMED')!='true': raise RuntimeError('Сначала пройдите приёмку по README')
     for key,default in [('CATALOG_SYNC_SECONDS','300'),('CATALOG_MAX_AGE_SECONDS','900'),('PHOTO_REFRESH_SECONDS','86400'),('PHOTO_CACHE_MAX_MB','1024')]:
         if int(os.getenv(key,default))<=0: raise RuntimeError(key+': нужно положительное число')
+    test_auto_time()
     with database.single_worker():
         init_db()
         CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
@@ -203,7 +213,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.4.0',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.4.1',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -230,7 +240,7 @@ async def health():
     return {'ok':True,'mode':MODE,'database':'postgresql' if database.postgres() else 'sqlite','catalog_ready':bool(current_stores()) if not DEMO else True}
 
 @app.get('/api/config')
-async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
+async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
 async def get_catalog(sid:str,uid=Depends(user)): return [{k:v for k,v in p.items() if k!='saby'} for p in await catalog(store_for(sid))]
 @app.get('/api/product-image/{key}')
@@ -250,7 +260,7 @@ class Checkout(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     phone:str=Field(pattern=r'^\+7\d{10}$')
     address:str=Field(default='',max_length=250)
-    slot:str=Field(max_length=30)
+    slot:str=Field(default='',max_length=30)
     items:list[Item]=Field(min_length=1,max_length=50)
     request_key:uuid.UUID
     consent:bool
@@ -262,7 +272,9 @@ async def checkout(body:Checkout,uid=Depends(user)):
         if old: return view(json.loads(old[0]))
         if sum(o['user_id']==uid and o['payment_status']=='pending' for o in all_orders())>=5: raise HTTPException(429,'Сначала завершите оплату созданных заказов')
         s=store_for(body.store_id); products={p['id']:p for p in await catalog(s,checkout=True)}
-        if body.slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
+        auto_time=test_auto_time()
+        chosen_slot=(datetime.now(TZ)+timedelta(minutes=31)).replace(second=0,microsecond=0).strftime('%Y-%m-%d %H:%M:%S') if auto_time else body.slot
+        if not auto_time and chosen_slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
         if len(set(i.id for i in body.items))!=len(body.items): raise HTTPException(400,'Повтор товара')
         items=[]
         for item in body.items:
@@ -273,7 +285,7 @@ async def checkout(body:Checkout,uid=Depends(user)):
         amount=sum(i['line_amount'] for i in items)
         if amount<=0 or amount>10000000: raise HTTPException(400,'Недопустимая сумма')
         o={'id':str(uuid.uuid4()),'user_id':uid,'store_id':s['id'],'name':body.name.strip(),'phone':body.phone,
-           'address':body.address,'slot':body.slot,'items':items,'amount':amount,'created':time.time(),
+           'address':body.address,'slot':chosen_slot,'test_auto_time':auto_time,'items':items,'amount':amount,'created':time.time(),
            'status':'awaiting_payment','payment_status':'pending','payment_id':None,'payment_url':None,
            'saby_phase':'none','consent_at':time.time()}
         with connect() as c: c.execute('INSERT INTO orders VALUES(?,?,?,?)',(o['id'],uid,str(body.request_key),json.dumps(o,ensure_ascii=False)))
@@ -284,6 +296,8 @@ async def payment(oid:str,uid=Depends(user)):
         o=owned(oid,uid)
         if o['payment_status']!='pending': return view(o)
         if DEMO: return view(o)
+        if o.get('test_auto_time') and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_')):
+            raise HTTPException(409,'Этот заказ предназначен только для тестового магазина ЮKassa')
         if not o.get('payment_id'):
             if time.time()-o['created']>23*3600:
                 raise HTTPException(409,'Срок создания платежа истёк. Оформите новый заказ; при сомнениях обратитесь в поддержку')
