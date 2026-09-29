@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from .products import line_item
 from . import database
 from .catalog_cache import CatalogCache
+from .diagnostics import safe_error
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .integrations import Saby, YooKassa, telegram, TZ, IntegrationError
@@ -149,13 +150,25 @@ async def tick():
                 o['saby_phase']='sending';save(o)
                 try:
                     result=await SABY.create(o,store_for(o['store_id']))
-                    external=result.get('externalId')
-                    uuid.UUID(str(external))
-                    o.update(saby_id=external,saby_phase='sent');status(o,'accepted');save(o)
-                    queue(store_for(o['store_id'])['chat_id'],f"Оплачен заказ #{o['id'][:8]}. Откройте «Доставку» Saby. Для сообщения покупателю ответьте на это сообщение.",o['id'])
-                except Exception:
-                    o['saby_phase']='uncertain';status(o,'attention');save(o)
+                    external=result.get('externalId') if isinstance(result,dict) else None
+                    if external:
+                        try: external=str(uuid.UUID(str(external)))
+                        except ValueError: external=None
+                    if not external:
+                        keys=','.join(str(k) for k in result)[:300] if isinstance(result,dict) else type(result).__name__
+                        raise IntegrationError('Ответ создания заказа без корректного externalId; поля ответа: '+keys)
+                except Exception as exc:
+                    o.update(saby_phase='uncertain',status='attention',saby_error=safe_error(exc,o),saby_attempt_at=time.time())
+                    save(o)
+                    logging.getLogger(__name__).warning('Saby order %s: %s',o['id'],json.dumps(o['saby_error'],ensure_ascii=False))
                     queue(os.getenv('ADMIN_CHAT_ID'),f"Проверьте Saby: неопределённый результат передачи #{o['id']}. Автоповтор отключён, чтобы не создать дубль.",o['id'])
+                else:
+                    # Persist accepted external ID before sending notifications.
+                    # A notification failure must never turn an accepted order into a retry.
+                    o.update(saby_id=external,saby_phase='sent',status='accepted',saby_error=None,saby_attempt_at=time.time())
+                    save(o)
+                    queue(o['user_id'],f"Заказ #{o['id'][:8]}: {LABELS['accepted']}",o['id'])
+                    queue(store_for(o['store_id']).get('chat_id',''),f"Оплачен заказ #{o['id'][:8]}. Откройте «Доставку» Saby. Для сообщения покупателю ответьте на это сообщение.",o['id'])
             elif not DEMO and o.get('saby_phase')=='sent' and o['status'] not in ('completed','canceled'):
                 try:
                     result=await SABY.state(o['saby_id'])
@@ -213,7 +226,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.4.1',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.4.3',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):

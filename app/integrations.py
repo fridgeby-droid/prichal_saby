@@ -43,9 +43,14 @@ class Saby:
                 if r.status_code == 401:
                     if self.token == used_token: self.token = None
                     if method == 'GET' and attempt == 0: continue
-                if r.is_error: raise IntegrationError(f'Saby: {path}, HTTP {r.status_code}. Проверьте права API и настройки точки.')
+                if r.is_error:
+                    try:
+                        error=r.json()
+                        detail={k:error[k] for k in ('error','message','details','code') if k in error} if isinstance(error,dict) else {}
+                    except ValueError: detail={}
+                    raise IntegrationError(f'Saby: {path}, HTTP {r.status_code}. '+json.dumps(detail,ensure_ascii=False)[:3000])
                 data = r.json()
-                if isinstance(data,dict) and data.get('error'): raise IntegrationError('Ошибка API Saby')
+                if isinstance(data,dict) and data.get('error'): raise IntegrationError('Ошибка API Saby: '+json.dumps({k:data[k] for k in ('error','message','details','code') if k in data},ensure_ascii=False)[:3000])
                 return data
 
     async def pages(self, path, key, params):

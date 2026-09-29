@@ -10,7 +10,10 @@ async def main():
     sub=p.add_subparsers(dest='command',required=True)
     sub.add_parser('telegram-setup')
     sub.add_parser('attention')
+    t=sub.add_parser('order-diagnostics');t.add_argument('order_id')
     sub.add_parser('saby-points')
+    sub.add_parser('saby-delivery-points')
+    sub.add_parser('saby-calendar')
     sub.add_parser('storage-check')
     sub.add_parser('catalog-sync')
     sub.add_parser('catalog-status')
@@ -38,6 +41,13 @@ async def main():
             with database.single_worker():
                 await s.CACHE.sync(s.STORES)
             print('Каталог синхронизирован')
+    elif args.command=='saby-delivery-points':
+        points=await s.SABY.pages('point/list','salesPoints',{'product':'delivery','withSchedule':'true'})
+        print(json.dumps([{k:p.get(k) for k in ('id','name','worktime','workdays')} for p in points],ensure_ascii=False,indent=2))
+    elif args.command=='saby-calendar':
+        for pid in json.loads(os.environ['SABY_STORE_PRICES']):
+            calendar=await s.SABY.call('GET','delivery/calendar',params={'pointId':int(pid)})
+            print(json.dumps({'point_id':pid,'calendar':calendar},ensure_ascii=False,indent=2))
     elif args.command=='saby-points':
         print(json.dumps(await s.SABY.points(),ensure_ascii=False,indent=2))
     elif args.command=='saby-prices':
@@ -70,6 +80,13 @@ async def main():
         print('Webhook и кнопка меню настроены.')
     elif args.command=='saby-state':
         print(json.dumps(await s.SABY.state(str(uuid.UUID(args.external_id))),ensure_ascii=False,indent=2))
+    elif args.command=='order-diagnostics':
+        o=s.get_order(args.order_id)
+        fields=('id','store_id','status','payment_status','saby_phase','saby_id','slot','test_auto_time','saby_attempt_at','saby_error')
+        result={k:o.get(k) for k in fields}
+        if not o.get('saby_error') and o.get('saby_phase')=='uncertain':
+            result['note']='Причина старой ошибки не сохранена. Сначала проверьте наличие заказа в Saby; повтор автоматически не выполняется.'
+        print(json.dumps(result,ensure_ascii=False,indent=2))
     elif args.command=='attention':
         for o in s.all_orders():
             if o.get('saby_phase') in ('uncertain','sending'): print(o['id'],o['store_id'],o['saby_phase'])
