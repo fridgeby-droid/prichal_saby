@@ -11,6 +11,9 @@ async def main():
     sub.add_parser('telegram-setup')
     sub.add_parser('attention')
     sub.add_parser('saby-points')
+    sub.add_parser('storage-check')
+    sub.add_parser('catalog-sync')
+    sub.add_parser('catalog-status')
     t=sub.add_parser('saby-prices');t.add_argument('point_id',type=int)
     sub.add_parser('saby-check')
     t=sub.add_parser('saby-photos');t.add_argument('--name',default='');t.add_argument('--limit',type=int,default=5)
@@ -18,7 +21,24 @@ async def main():
     t=sub.add_parser('attach-saby');t.add_argument('order_id');t.add_argument('external_id')
     t=sub.add_parser('retry-saby');t.add_argument('order_id');t.add_argument('--confirmed-absent',action='store_true',required=True)
     args=p.parse_args()
-    if args.command=='saby-points':
+    if args.command in ('storage-check','catalog-status','catalog-sync'):
+        from app import database
+        database.init(s.DB)
+        if args.command=='storage-check':
+            s.CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
+            probe=s.CACHE.photo_dir/('probe-'+uuid.uuid4().hex)
+            try: probe.write_text('ok')
+            finally: probe.unlink(missing_ok=True)
+            with s.connect() as c: c.execute('SELECT 1').fetchone()
+            print(json.dumps({'database':'postgresql' if database.postgres() else 'sqlite','photos_writable':True,'photo_dir':str(s.CACHE.photo_dir)},ensure_ascii=False))
+        elif args.command=='catalog-status':
+            print(json.dumps(s.CACHE.read('sync_status')[0] or {'status':'Ещё не синхронизирован'},ensure_ascii=False,indent=2))
+        else:
+            # A second process must not race the background catalogue worker.
+            with database.single_worker():
+                await s.CACHE.sync(s.STORES)
+            print('Каталог синхронизирован')
+    elif args.command=='saby-points':
         print(json.dumps(await s.SABY.points(),ensure_ascii=False,indent=2))
     elif args.command=='saby-prices':
         print(json.dumps(await s.SABY.prices(args.point_id),ensure_ascii=False,indent=2))

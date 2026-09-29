@@ -87,7 +87,7 @@ def test_chat_shop_scope(client,monkeypatch):
     monkeypatch.setenv('BOT_TOKEN','')
     o,_=new_order(client)
     monkeypatch.setitem(s.STORES[0],'chat_id',-1001);monkeypatch.setitem(s.STORES[0],'staff_ids',[55])
-    with s.connect() as db: db.execute('INSERT OR REPLACE INTO replies VALUES(?,?,?)',('-1001',987,o['id']))
+    with s.connect() as db: db.execute('INSERT INTO replies VALUES(?,?,?) ON CONFLICT(chat,message_id) DO UPDATE SET order_id=excluded.order_id',('-1001',987,o['id']))
     body={'update_id':100,'message':{'chat':{'id':-1001,'type':'supergroup'},'from':{'id':66},'text':'Wrong staff','reply_to_message':{'message_id':987}}}
     h={'X-Telegram-Bot-Api-Secret-Token':'hook-secret'}
     client.post('/webhooks/telegram',json=body,headers=h)
@@ -105,6 +105,7 @@ def test_saby_single_send_and_unknown_result(client,monkeypatch):
         calls.append(order['id']);return {'externalId':str(uuid.uuid4())}
     async def state(oid): return {'productState':101}
     monkeypatch.setattr(s,'DEMO',False)
+    monkeypatch.setattr(s.CACHE,'stores',lambda:s.STORES)
     monkeypatch.setattr(s.SABY,'create',create);monkeypatch.setattr(s.SABY,'state',state)
     monkeypatch.setenv('SABY_STATE_MAP','{"101":"ready"}')
     asyncio.run(s.tick());asyncio.run(s.tick())

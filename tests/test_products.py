@@ -51,7 +51,7 @@ def test_checkout_weight_server_validation(monkeypatch):
     from app import server as s
     from fastapi.testclient import TestClient
     from uuid import uuid4
-    async def catalog(store): return [{'id':'weight','name':'Сыр','unit':'кг','stock':0.19,'price':99900,'saby':{'id':1}}]
+    async def catalog(store,checkout=False): return [{'id':'weight','name':'Сыр','unit':'кг','stock':0.19,'price':99900,'saby':{'id':1}}]
     monkeypatch.setattr(s,'catalog',catalog)
     with TestClient(s.app) as c:
         c.get('/')

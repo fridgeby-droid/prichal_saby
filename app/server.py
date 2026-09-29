@@ -1,4 +1,4 @@
-import asyncio, contextlib, hashlib, hmac, json, os, re, secrets, sqlite3, time, uuid
+import asyncio, contextlib, hashlib, hmac, json, logging, os, re, secrets, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -7,6 +7,8 @@ from decimal import Decimal
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import FileResponse, JSONResponse, Response
 from .products import line_item
+from . import database
+from .catalog_cache import CatalogCache
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .integrations import Saby, YooKassa, telegram, TZ, IntegrationError
@@ -23,21 +25,13 @@ LABELS={'awaiting_payment':'Ожидает оплаты','paid':'Оплачен 
         'collecting':'Собираем','ready':'Готов к самовывозу','completed':'Выдан','canceled':'Отменён',
         'attention':'Оплачен · уточняем передачу магазину'}
 
-def connect():
-    c=sqlite3.connect(DB,timeout=15); c.row_factory=sqlite3.Row
-    return c
+def connect(): return database.connect(DB)
+
+CACHE=CatalogCache(connect,SABY,os.getenv('PHOTO_DIR',str(DB.parent/'photos')))
 
 def init_db():
-    DB.parent.mkdir(parents=True,exist_ok=True)
+    database.init(DB)
     with connect() as c:
-        c.executescript('''PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_key TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(user_id,request_key));
-        CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT, sender TEXT, text TEXT, created REAL);
-        CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, text TEXT, order_id TEXT, sent INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS replies(chat TEXT, message_id INTEGER, order_id TEXT, PRIMARY KEY(chat,message_id));
-        CREATE TABLE IF NOT EXISTS tg_updates(id INTEGER PRIMARY KEY);
-        CREATE TABLE IF NOT EXISTS active_chats(user_id TEXT PRIMARY KEY,order_id TEXT);
-        ''')
         # An interrupted POST must not be blindly retried.
         for row in c.execute('SELECT data FROM orders').fetchall():
             o=json.loads(row[0])
@@ -46,15 +40,25 @@ def init_db():
                 c.execute('UPDATE orders SET data=? WHERE id=?',(json.dumps(o,ensure_ascii=False),o['id']))
 
 def all_orders():
-    with connect() as c: return [json.loads(r[0]) for r in c.execute('SELECT data FROM orders ORDER BY rowid DESC')]
+    with connect() as c: return sorted([json.loads(r[0]) for r in c.execute('SELECT data FROM orders')],key=lambda o:o['created'],reverse=True)
 def get_order(oid):
     with connect() as c: r=c.execute('SELECT data FROM orders WHERE id=?',(oid,)).fetchone()
     if not r: raise HTTPException(404,'Заказ не найден')
     return json.loads(r[0])
 def save(o):
     with connect() as c: c.execute('UPDATE orders SET data=? WHERE id=?',(json.dumps(o,ensure_ascii=False),o['id']))
+def current_stores():
+    if DEMO: return STORES
+    stores=CACHE.stores() or []
+    mapping=json.loads(os.getenv('SABY_STORE_PRICES','{}'))
+    chats=json.loads(os.getenv('SABY_STORE_CHATS','{}'))
+    staff=json.loads(os.getenv('SABY_STORE_STAFF','{}'))
+    if mapping:
+        stores=[{**s,'price_list_id':mapping[s['id']]} for s in stores if s['id'] in mapping]
+    return [{**s,'chat_id':chats.get(s['id'],s.get('chat_id','')),'staff_ids':staff.get(s['id'],s.get('staff_ids',[]))} for s in stores]
+
 def store_for(sid):
-    for s in STORES:
+    for s in current_stores():
         if s['id']==sid: return s
     raise HTTPException(404,'Магазин не найден')
 def queue(chat,text,oid):
@@ -105,7 +109,7 @@ def demo_catalog(sid):
       ('cheese','Сырные палочки, 100 г',17900,'Закуски','▱'),('crackers','Сухарики с чесноком',8900,'Снеки','▥'),
       ('lemonade','Лимонад, 0,5 л',11900,'Напитки','◉'),('water','Вода, 0,5 л',5900,'Напитки','◌')]
     return [{'id':a,'name':b,'price':c,'category':d,'icon':e,'unit':'шт','stock':20 if sid=='center' else 12,'saby':{'nomNumber':a}} for a,b,c,d,e in goods]
-async def catalog(s): return demo_catalog(s['id']) if DEMO else await SABY.catalog(s)
+async def catalog(s,checkout=False): return demo_catalog(s['id']) if DEMO else CACHE.products(s,checkout)
 async def slots(s):
     if not DEMO: return await SABY.slots(s)
     now=datetime.now(TZ); first=now.replace(second=0,microsecond=0)+timedelta(minutes=30-now.minute%30)
@@ -157,7 +161,7 @@ async def tick():
                 result=await telegram('sendMessage',{'chat_id':job['chat'],'text':job['text']})
                 with connect() as c:
                     c.execute('UPDATE outbox SET sent=1 WHERE id=?',(job['id'],))
-                    c.execute('INSERT OR REPLACE INTO replies VALUES(?,?,?)',(job['chat'],result['message_id'],job['order_id']))
+                    c.execute('INSERT INTO replies VALUES(?,?,?) ON CONFLICT(chat,message_id) DO UPDATE SET order_id=excluded.order_id',(job['chat'],result['message_id'],job['order_id']))
             except Exception:
                 with connect() as c: c.execute('UPDATE outbox SET attempts=attempts+1 WHERE id=?',(job['id'],))
 async def worker():
@@ -166,29 +170,40 @@ async def worker():
         except Exception: pass
         await asyncio.sleep(15)
 
+async def catalog_worker():
+    while True:
+        try: await CACHE.sync(STORES)
+        except Exception: pass  # Status is persisted; last complete snapshot remains available.
+        await asyncio.sleep(max(60,int(os.getenv('CATALOG_SYNC_SECONDS','300'))))
+
 @asynccontextmanager
 async def lifespan(app):
-    global STORES
     if MODE not in ('demo','catalog','integration'): raise RuntimeError('APP_MODE: demo, catalog или integration')
     if not DEMO:
         if any(not os.getenv(k) for k in ('SABY_CLIENT_ID','SABY_APP_SECRET','SABY_SECRET_KEY')): raise RuntimeError('Заполните ключи Saby')
-        if os.getenv('SABY_STORE_PRICES'): STORES=await SABY.configured_stores()
-        elif CATALOG_ONLY: raise RuntimeError('Заполните SABY_STORE_PRICES')
+        mapping=json.loads(os.getenv('SABY_STORE_PRICES','{}'))
+        if not isinstance(mapping,dict) or not mapping or any(not v for v in mapping.values()):
+            raise RuntimeError('SABY_STORE_PRICES: нужен непустой JSON вида {"ID_точки": ID_прайса}')
     if not DEMO and not CATALOG_ONLY:
-
-        required=['BOT_TOKEN','TELEGRAM_WEBHOOK_SECRET','SABY_CLIENT_ID','SABY_APP_SECRET','SABY_SECRET_KEY','YOOKASSA_SHOP_ID','YOOKASSA_SECRET_KEY']
+        required=['BOT_TOKEN','TELEGRAM_WEBHOOK_SECRET','YOOKASSA_SHOP_ID','YOOKASSA_SECRET_KEY']
         if any(not os.getenv(k) for k in required): raise RuntimeError('Не заполнены параметры интеграции')
         if not BASE.startswith('https://'): raise RuntimeError('Для интеграции нужен PUBLIC_URL с HTTPS')
         if not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_') and os.getenv('ALLOW_REAL_PAYMENTS')!='true': raise RuntimeError('Разрешён только тестовый ключ ЮKassa')
         if os.getenv('ALLOW_REAL_PAYMENTS')=='true' and os.getenv('LIVE_ACCEPTANCE_CONFIRMED')!='true': raise RuntimeError('Сначала пройдите приёмку по README')
-        if any(not s['point_id'] or not s['price_list_id'] for s in STORES): raise RuntimeError('Заполните магазины и прайсы')
-    init_db()
-    task=asyncio.create_task(worker())
-    yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError): await task
+    for key,default in [('CATALOG_SYNC_SECONDS','300'),('CATALOG_MAX_AGE_SECONDS','900'),('PHOTO_REFRESH_SECONDS','86400'),('PHOTO_CACHE_MAX_MB','1024')]:
+        if int(os.getenv(key,default))<=0: raise RuntimeError(key+': нужно положительное число')
+    with database.single_worker():
+        init_db()
+        CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
+        tasks=[asyncio.create_task(worker())]
+        if not DEMO: tasks.append(asyncio.create_task(catalog_worker()))
+        try: yield
+        finally:
+            for task in tasks: task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.3.2',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.4.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -197,7 +212,7 @@ async def limits(request,call_next):
     if int(request.headers.get('content-length','0') or 0)>100000: return JSONResponse({'detail':'Слишком большой запрос'},status_code=413)
     response=await call_next(request)
     response.headers['X-Content-Type-Options']='nosniff';response.headers['Referrer-Policy']='no-referrer'
-    response.headers['Cache-Control']='no-store'
+    if 'cache-control' not in response.headers: response.headers['Cache-Control']='no-store'
     return response
 @app.exception_handler(IntegrationError)
 async def saby_error(request,exc): return JSONResponse({'detail':str(exc)},status_code=503)
@@ -210,17 +225,19 @@ async def index(request:Request):
         r.set_cookie('demo_session',secrets.token_hex(24),httponly=True,secure=BASE.startswith('https'),samesite='lax',max_age=2592000)
     return r
 @app.get('/health')
-async def health(): return {'ok':True,'mode':MODE}
+async def health():
+    with connect() as c: c.execute('SELECT 1').fetchone()
+    return {'ok':True,'mode':MODE,'database':'postgresql' if database.postgres() else 'sqlite','catalog_ready':bool(current_stores()) if not DEMO else True}
+
 @app.get('/api/config')
-async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in STORES],'bot_username':os.getenv('BOT_USERNAME','')}
+async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
 async def get_catalog(sid:str,uid=Depends(user)): return [{k:v for k,v in p.items() if k!='saby'} for p in await catalog(store_for(sid))]
 @app.get('/api/product-image/{key}')
 async def product_image(key:str):
-    path=SABY.images.get(key)
-    if not path: raise HTTPException(404,'Фото отсутствует; обновите каталог')
-    content,mime=await SABY.call('GET',path,binary=True)
-    return Response(content,media_type=mime)
+    photo=CACHE.local_photo(key)
+    if not photo: raise HTTPException(404,'Фото пока не загружено')
+    return FileResponse(photo[0],media_type=photo[1],headers={'Cache-Control':'public, max-age=3600'})
 
 @app.get('/api/slots/{sid}')
 async def get_slots(sid:str,uid=Depends(user)): return await slots(store_for(sid))
@@ -244,7 +261,7 @@ async def checkout(body:Checkout,uid=Depends(user)):
         with connect() as c: old=c.execute('SELECT data FROM orders WHERE user_id=? AND request_key=?',(uid,str(body.request_key))).fetchone()
         if old: return view(json.loads(old[0]))
         if sum(o['user_id']==uid and o['payment_status']=='pending' for o in all_orders())>=5: raise HTTPException(429,'Сначала завершите оплату созданных заказов')
-        s=store_for(body.store_id); products={p['id']:p for p in await catalog(s)}
+        s=store_for(body.store_id); products={p['id']:p for p in await catalog(s,checkout=True)}
         if body.slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
         if len(set(i.id for i in body.items))!=len(body.items): raise HTTPException(400,'Повтор товара')
         items=[]
@@ -334,7 +351,7 @@ async def tg_hook(request:Request):
                 oid=text.split(maxsplit=1)[1].strip()
                 try:
                     owned(oid,sender)
-                    with connect() as c: c.execute('INSERT OR REPLACE INTO active_chats VALUES(?,?)',(sender,oid))
+                    with connect() as c: c.execute('INSERT INTO active_chats VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET order_id=excluded.order_id',(sender,oid))
                     queue(chat,'Выбран заказ #'+oid[:8]+'. Напишите сообщение магазину.',oid)
                 except HTTPException: queue(chat,'Заказ не найден. Скопируйте полный номер из Mini App.','')
             else:
@@ -349,7 +366,7 @@ async def tg_hook(request:Request):
                     except HTTPException: pass
                 else: queue(chat,'Выберите заказ: /order ПОЛНЫЙ_НОМЕР или напишите из Mini App.','')
         elif text:
-            s=next((s for s in STORES if str(s['chat_id'])==chat and sender in [str(x) for x in s['staff_ids']]),None)
+            s=next((s for s in current_stores() if str(s.get('chat_id',''))==chat and sender in [str(x) for x in s.get('staff_ids',[])]),None)
             reply=m.get('reply_to_message',{}).get('message_id')
             if s and reply:
                 with connect() as c: row=c.execute('SELECT order_id FROM replies WHERE chat=? AND message_id=?',(chat,reply)).fetchone()

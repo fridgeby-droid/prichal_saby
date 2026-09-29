@@ -40,5 +40,17 @@ $('cartBtn').onclick=()=>run(openCart);$('closeCart').onclick=()=>$('cartDialog'
 $('checkoutForm').onsubmit=e=>{e.preventDefault();run(async()=>{const b=$('submitOrder');b.disabled=true;try{state.requestKey??=crypto.randomUUID();let phone=$('phone').value.replace(/\D/g,'');if(phone.startsWith('8')&&phone.length===11)phone='7'+phone.slice(1);if(!/^7\d{10}$/.test(phone))throw Error('Введите телефон в формате +7 999 123-45-67');const o=await api('/orders',{store_id:$('store').value,name:$('name').value,phone:'+'+phone,address:$('address').value,slot:$('slot').value,items:Object.entries(state.cart).map(([id,qty])=>({id,qty})),request_key:state.requestKey,consent:$('consent').checked});state.cart={};state.requestKey=null;render();$('cartDialog').close();await openOrder(o.id);if(!state.config.demo)await pay()}finally{b.disabled=false}})};
 $('chatForm').onsubmit=e=>{e.preventDefault();run(async()=>{const b=$('chatForm').querySelector('button');b.disabled=true;try{await api('/orders/'+state.order+'/messages',{text:$('chatText').value});$('chatText').value='';await refreshOrder();$('messages').scrollTop=$('messages').scrollHeight}finally{b.disabled=false}})};
 $('nearby').onclick=()=>{if(!navigator.geolocation)return toast('Выберите магазин вручную');navigator.geolocation.getCurrentPosition(pos=>run(async()=>{const {latitude,longitude}=pos.coords;const list=state.config.stores.filter(s=>Number.isFinite(s.lat)&&Number.isFinite(s.lon));if(!list.length)return toast('Координаты магазинов ещё не настроены');const dist=s=>(s.lat-latitude)**2+((s.lon-longitude)*Math.cos(latitude*Math.PI/180))**2;list.sort((a,b)=>dist(a)-dist(b));$('store').value=list[0].id;await loadStore();toast('Выбран ближайший магазин')}),()=>toast('Нет доступа к геолокации. Выберите магазин вручную'),{timeout:10000})};
-run(async()=>{state.config=await api('/config');$('demo').hidden=!state.config.demo&&!state.config.catalog_only;if(state.config.catalog_only){$('demo').textContent='Каталог Saby · оформление пока отключено';$('ordersBtn').hidden=true;}$('store').innerHTML=state.config.stores.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');if(tg?.initDataUnsafe?.user?.first_name)$('name').value=tg.initDataUnsafe.user.first_name;await loadStore();const id=new URLSearchParams(location.search).get('order');if(id)await openOrder(id)});
+async function boot(){
+state.config=await api('/config');
+$('demo').hidden=!state.config.demo&&!state.config.catalog_only;
+if(state.config.catalog_only){$('demo').textContent='Каталог Saby · оформление пока отключено';$('ordersBtn').hidden=true;}
+if(!state.config.stores.length){$('products').innerHTML='';$('empty').hidden=false;$('empty').textContent='Загружаем каталог магазина. Страница обновится автоматически.';window.setTimeout(()=>run(boot),5000);return;}
+$('empty').textContent='Товары не найдены';
+$('store').innerHTML=state.config.stores.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');
+if(tg?.initDataUnsafe?.user?.first_name)$('name').value=tg.initDataUnsafe.user.first_name;
+try{await loadStore()}catch(e){toast(e.message);window.setTimeout(()=>run(boot),5000);return;}const id=new URLSearchParams(location.search).get('order');if(id)await openOrder(id);
+}
+run(boot);
+// Retry photos while the initial background download is still in progress.
+setInterval(()=>{document.querySelectorAll('img[hidden]').forEach(img=>{img.hidden=false;if(img.nextElementSibling)img.nextElementSibling.hidden=true;const url=new URL(img.src);url.searchParams.set('retry',Date.now());img.src=url.href;})},30000);
 setInterval(()=>{if(!$('orderView').hidden)run(refreshOrder)},15000);
