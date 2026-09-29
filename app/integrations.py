@@ -154,7 +154,9 @@ class Saby:
 
     async def create(self, order, store):
         body={'product':'delivery','pointId':store['point_id'],
-          'customer':{'name':order['name'],'phone':order['phone'],'externalId':'tg:'+str(order['user_id'])},
+          # externalId is optional. Telegram IDs with a tg: prefix are rejected
+          # by Saby; keep the Telegram association in our own order database.
+          'customer':{'name':order['name'],'phone':order['phone']},
           'datetime':order['slot'],'comment':f"Mini App #{order['id']} / Оплачено ЮKassa. Закрыть неучитываемым типом оплаты. Повторно оплату не брать.",
           'nomenclatures':[{**i['saby'],'name':i['name'],'count':i['qty'],'cost':i['price']/100,
                            'priceListId':store['price_list_id']} for i in order['items']],
