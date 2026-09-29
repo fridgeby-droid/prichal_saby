@@ -42,8 +42,20 @@ async def main():
                 await s.CACHE.sync(s.STORES)
             print('Каталог синхронизирован')
     elif args.command=='saby-delivery-points':
-        points=await s.SABY.pages('point/list','salesPoints',{'product':'delivery','withSchedule':'true'})
-        print(json.dumps([{k:p.get(k) for k in ('id','name','worktime','workdays')} for p in points],ensure_ascii=False,indent=2))
+        # Diagnostic intentionally bypasses collection parsing: null, empty and
+        # unexpected responses must remain visible instead of raising a parser error.
+        raw=await s.SABY.call('GET','point/list',params={'product':'delivery','withSchedule':'true','page':0,'pageSize':100})
+        def scrub(value):
+            if isinstance(value,dict):
+                return {k:('[скрыто]' if any(word in k.lower() for word in ('phone','email','token','secret','password','authorization')) else scrub(v)) for k,v in value.items()}
+            if isinstance(value,list): return [scrub(v) for v in value]
+            if isinstance(value,str):
+                for key in ('BOT_TOKEN','SABY_CLIENT_ID','SABY_APP_SECRET','SABY_SECRET_KEY','DATABASE_URL','YOOKASSA_SECRET_KEY'):
+                    secret=os.getenv(key,'')
+                    if secret: value=value.replace(secret,'[скрыто]')
+                if s.SABY.token: value=value.replace(s.SABY.token,'[скрыто]')
+            return value
+        print(json.dumps({'product':'delivery','page':0,'page_size':100,'configured_point_ids':list(json.loads(os.getenv('SABY_STORE_PRICES','{}'))),'response_type':type(raw).__name__,'response':scrub(raw)},ensure_ascii=False,indent=2))
     elif args.command=='saby-calendar':
         for pid in json.loads(os.environ['SABY_STORE_PRICES']):
             calendar=await s.SABY.call('GET','delivery/calendar',params={'pointId':int(pid)})
