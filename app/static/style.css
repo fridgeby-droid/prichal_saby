@@ -71,3 +71,6 @@
 .hero h1,.hero p{max-width:calc(100% - 205px)}
 @media(max-width:600px){.brand-official{padding:8px 10px}.brand-official img{width:150px}.hero-art.hero-logo{width:96px;right:14px;top:58%;transform:translateY(-50%);opacity:.75}.hero h1,.hero p{max-width:calc(100% - 104px)}.hero h1{font-size:22px}}
 @media(max-width:360px){.brand-official img{width:130px}header{padding-left:16px;padding-right:16px}.hero-art.hero-logo{width:75px;right:12px}.hero h1,.hero p{max-width:calc(100% - 82px)}.hero h1{font-size:20px}}
+
+/* Keep category navigation visible while browsing the shop section. */
+#categories.chips{position:sticky;top:0;z-index:4;background:var(--paper);padding:10px 0 12px;border-bottom:1px solid var(--line);box-shadow:0 5px 8px -8px #123d3966}
