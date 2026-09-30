@@ -226,7 +226,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.4.7',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.4.8',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
