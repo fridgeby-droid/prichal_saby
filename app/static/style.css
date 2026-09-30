@@ -62,3 +62,12 @@
 .subcategories{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .subcategories button{font-size:11px;background:#e8ecdf;border-color:transparent}
 @media(max-width:600px){.hero{min-height:143px;padding:14px 18px}.hero h1{font-size:24px;margin:8px 0 6px;max-width:78%}.hero p{font-size:11px;line-height:1.35;max-width:75%}.hero-art{right:0;top:36px;transform:scale(.36);transform-origin:right top}.hero .eyebrow{font-size:8px;letter-spacing:1.5px}}
+
+/* Official vector logo from the supplied CorelDRAW artwork. */
+.brand-official{background:var(--pine);border-radius:12px;padding:10px 12px;flex:none}
+.brand-official img{display:block;width:180px;height:auto}
+.hero-art.hero-logo{width:180px;height:auto;right:24px;top:50%;transform:translateY(-50%);opacity:.85}
+.hero-logo img{display:block;width:100%;height:auto}
+.hero h1,.hero p{max-width:calc(100% - 205px)}
+@media(max-width:600px){.brand-official{padding:8px 10px}.brand-official img{width:150px}.hero-art.hero-logo{width:96px;right:14px;top:58%;transform:translateY(-50%);opacity:.75}.hero h1,.hero p{max-width:calc(100% - 104px)}.hero h1{font-size:22px}}
+@media(max-width:360px){.brand-official img{width:130px}header{padding-left:16px;padding-right:16px}.hero-art.hero-logo{width:75px;right:12px}.hero h1,.hero p{max-width:calc(100% - 82px)}.hero h1{font-size:20px}}
