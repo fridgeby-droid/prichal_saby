@@ -226,7 +226,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.4.6',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.4.7',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -255,7 +255,15 @@ async def health():
 @app.get('/api/config')
 async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
-async def get_catalog(sid:str,uid=Depends(user)): return [{k:v for k,v in p.items() if k!='saby'} for p in await catalog(store_for(sid))]
+async def get_catalog(sid:str,uid=Depends(user)):
+    # Ordered product IDs, optionally different for each store.
+    try:
+        setting=json.loads(os.getenv('CATALOG_FEATURED_IDS','[]'))
+        featured=setting.get(sid,setting.get('*',[])) if isinstance(setting,dict) else setting
+        if not isinstance(featured,list): featured=[]
+        ranks={str(pid):i for i,pid in reversed(list(enumerate(featured)))}
+    except (ValueError,TypeError): ranks={}
+    return [{**{k:v for k,v in p.items() if k!='saby'},'display_rank':ranks.get(str(p['id']),1000000)} for p in await catalog(store_for(sid))]
 @app.get('/api/product-image/{key}')
 async def product_image(key:str):
     photo=CACHE.local_photo(key)

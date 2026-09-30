@@ -110,7 +110,7 @@ class Saby:
             if not batch: break
             for p in batch:
                 if p.get('isParent'):
-                    folders[str(p.get('hierarchicalId'))]=p.get('name','Каталог')
+                    folders[str(p.get('hierarchicalId'))]=(p.get('name','Каталог'),str(p.get('hierarchicalParent')))
                     continue
                 if p.get('published') is False: continue
                 if p.get('cost') is None: continue
@@ -137,7 +137,13 @@ class Saby:
             outcome=result.get('outcome') if isinstance(result,dict) else None
             if outcome is False or (isinstance(outcome,dict) and outcome.get('hasMore') is False): break
         else: raise IntegrationError('Каталог слишком большой для v0.1')
-        for row in rows: row['category']=folders.get(row.pop('parent'),'Каталог')
+        for row in rows:
+            parent=row.pop('parent'); path=[]; seen=set()
+            while parent in folders and parent not in seen:
+                seen.add(parent)
+                name,parent=folders[parent]; path.insert(0,name)
+            row['category_path']=path or ['Каталог']
+            row['category']=row['category_path'][-1]
         return rows
 
     async def slots(self, store):

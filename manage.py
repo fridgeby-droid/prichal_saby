@@ -17,6 +17,7 @@ async def main():
     sub.add_parser('storage-check')
     sub.add_parser('catalog-sync')
     sub.add_parser('catalog-status')
+    sub.add_parser('catalog-products')
     t=sub.add_parser('saby-prices');t.add_argument('point_id',type=int)
     sub.add_parser('saby-check')
     t=sub.add_parser('saby-photos');t.add_argument('--name',default='');t.add_argument('--limit',type=int,default=5)
@@ -24,7 +25,15 @@ async def main():
     t=sub.add_parser('attach-saby');t.add_argument('order_id');t.add_argument('external_id')
     t=sub.add_parser('retry-saby');t.add_argument('order_id');t.add_argument('--confirmed-absent',action='store_true',required=True)
     args=p.parse_args()
-    if args.command in ('storage-check','catalog-status','catalog-sync'):
+    if args.command=='catalog-products':
+        from app import database
+        database.init(s.DB)
+        result=[]
+        for store in s.current_stores():
+            products=await s.catalog(store)
+            result.append({'store_id':store['id'],'products':[{'id':x['id'],'name':x['name'],'category_path':x.get('category_path',[x.get('category','Каталог')])} for x in products]})
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+    elif args.command in ('storage-check','catalog-status','catalog-sync'):
         from app import database
         database.init(s.DB)
         if args.command=='storage-check':
