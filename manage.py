@@ -14,6 +14,7 @@ async def main():
     sub.add_parser('saby-points')
     sub.add_parser('saby-delivery-points')
     sub.add_parser('saby-calendar')
+    t=sub.add_parser('saby-districts');t.add_argument('point_id',type=int)
     sub.add_parser('storage-check')
     sub.add_parser('catalog-sync')
     sub.add_parser('catalog-status')
@@ -65,6 +66,8 @@ async def main():
                 if s.SABY.token: value=value.replace(s.SABY.token,'[скрыто]')
             return value
         print(json.dumps({'product':'delivery','page':0,'page_size':100,'configured_point_ids':list(json.loads(os.getenv('SABY_STORE_PRICES','{}'))),'response_type':type(raw).__name__,'response':scrub(raw)},ensure_ascii=False,indent=2))
+    elif args.command=='saby-districts':
+        print(json.dumps(await s.SABY.call('GET','district/list',params={'pointId':args.point_id,'withCoordinates':'true'}),ensure_ascii=False,indent=2))
     elif args.command=='saby-calendar':
         for pid in json.loads(os.environ['SABY_STORE_PRICES']):
             calendar=await s.SABY.call('GET','delivery/calendar',params={'pointId':int(pid)})

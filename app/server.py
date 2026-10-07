@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import FileResponse, JSONResponse, Response
+from .pickup_rules import covers, minimum_amount
 from .products import line_item
 from . import database
 from .catalog_cache import CatalogCache
@@ -226,7 +227,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.4.10',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.5.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -253,7 +254,7 @@ async def health():
     return {'ok':True,'mode':MODE,'database':'postgresql' if database.postgres() else 'sqlite','catalog_ready':bool(current_stores()) if not DEMO else True}
 
 @app.get('/api/config')
-async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'stores':[{k:s.get(k) for k in ('id','name','address','lat','lon')} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
+async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'geo_required':geo_enabled(),'stores':[{**{k:s.get(k) for k in ('id','name','address','lat','lon')},'minimum_amount':minimum_amount(s['id'])} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
 async def get_catalog(sid:str,uid=Depends(user)):
     # Ordered product IDs, optionally different for each store.
@@ -272,6 +273,72 @@ async def product_image(key:str):
 
 @app.get('/api/slots/{sid}')
 async def get_slots(sid:str,uid=Depends(user)): return await slots(store_for(sid))
+
+class Location(BaseModel):
+    lat:float=Field(ge=-90,le=90,allow_inf_nan=False)
+    lon:float=Field(ge=-180,le=180,allow_inf_nan=False)
+    accuracy:float=Field(gt=0,le=100,allow_inf_nan=False)
+    captured_at:float=Field(allow_inf_nan=False)
+    consent:bool
+
+def geo_enabled(): return os.getenv('PICKUP_GEO_REQUIRED','true').lower()=='true'
+def profile(uid):
+    if CATALOG_ONLY: return None
+    return CACHE.read('pickup-profile:'+uid)[0]
+
+async def eligible(location):
+    if not location: raise HTTPException(409,'Определите местоположение для проверки района обслуживания')
+    # Revalidate stored coordinates too; never accept store IDs from the browser.
+    try:
+        point=Location(**location)
+        if not point.consent: raise ValueError()
+    except Exception: raise HTTPException(409,'Определите местоположение заново')
+    result=[]
+    for store in current_stores():
+        raw=await SABY.call('GET','district/list',params={'pointId':store['point_id'],'withCoordinates':'true'})
+        districts=raw.get('districts') if isinstance(raw,dict) else None
+        if districts=={}: districts=[]
+        if not isinstance(districts,list): raise IntegrationError('Не удалось проверить районы обслуживания. Повторите позже.')
+        if isinstance(raw.get('outcome'),dict) and raw['outcome'].get('hasMore'):
+            raise IntegrationError('Список районов неполный. Оформление временно недоступно.')
+        for d in districts:
+            if d.get('isParent'): continue
+            try: match=covers(d.get('coordinates'),point.lat,point.lon,point.accuracy)
+            except (ValueError,TypeError,OverflowError):
+                raise IntegrationError('Некорректные границы района Saby. Оформление временно недоступно.')
+            if match:
+                result.append({'store_id':store['id'],'district_id':d.get('districtId'),'district_name':d.get('name','')})
+                break
+    return result
+
+async def check_pickup(sid, location):
+    if not geo_enabled(): return None
+    matches=await eligible(location)
+    match=next((x for x in matches if x['store_id']==sid),None)
+    if not match: raise HTTPException(409,'Местоположение вне зоны выбранного магазина или слишком близко к границе. Повторите определение.')
+    return match
+
+@app.get('/api/pickup-profile')
+async def get_profile(uid=Depends(user)):
+    point=profile(uid)
+    matches=await eligible(point) if point and geo_enabled() else []
+    return {'location':point,'matches':matches}
+
+@app.post('/api/pickup-profile')
+async def set_profile(body:Location,uid=Depends(user)):
+    if CATALOG_ONLY: raise HTTPException(403,'Сохранение доступно после подключения оформления заказов')
+    if not body.consent: raise HTTPException(400,'Подтвердите сохранение местоположения')
+    if not 0<=time.time()-body.captured_at<=120: raise HTTPException(409,'Координаты устарели. Определите местоположение заново')
+    point=body.model_dump(); matches=await eligible(point)
+    if not matches: raise HTTPException(409,'Эта точка вне районов обслуживания или слишком близко к границе. Попробуйте уточнить местоположение.')
+    with connect() as c: CACHE.write(c,'pickup-profile:'+uid,point,time.time())
+    return {'location':point,'matches':matches}
+
+@app.post('/api/pickup-profile/clear')
+async def clear_profile(uid=Depends(user)):
+    if not CATALOG_ONLY:
+        with connect() as c: c.execute('DELETE FROM pickup_cache WHERE key=?',('pickup-profile:'+uid,))
+    return {'ok':True}
 
 class Item(BaseModel):
     id:str=Field(max_length=128)
@@ -292,7 +359,7 @@ async def checkout(body:Checkout,uid=Depends(user)):
         with connect() as c: old=c.execute('SELECT data FROM orders WHERE user_id=? AND request_key=?',(uid,str(body.request_key))).fetchone()
         if old: return view(json.loads(old[0]))
         if sum(o['user_id']==uid and o['payment_status']=='pending' for o in all_orders())>=5: raise HTTPException(429,'Сначала завершите оплату созданных заказов')
-        s=store_for(body.store_id); products={p['id']:p for p in await catalog(s,checkout=True)}
+        s=store_for(body.store_id); location=profile(uid); area=await check_pickup(s['id'],location); products={p['id']:p for p in await catalog(s,checkout=True)}
         auto_time=test_auto_time()
         chosen_slot=(datetime.now(TZ)+timedelta(minutes=31)).replace(second=0,microsecond=0).strftime('%Y-%m-%d %H:%M:%S') if auto_time else body.slot
         if not auto_time and chosen_slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
@@ -304,9 +371,10 @@ async def checkout(body:Checkout,uid=Depends(user)):
             try: items.append(line_item(p,item.qty))
             except ValueError as exc: raise HTTPException(409,str(exc))
         amount=sum(i['line_amount'] for i in items)
+        if amount<minimum_amount(s['id']): raise HTTPException(409,f"Минимальный заказ — {minimum_amount(s['id'])/100:g} ₽")
         if amount<=0 or amount>10000000: raise HTTPException(400,'Недопустимая сумма')
         o={'id':str(uuid.uuid4()),'user_id':uid,'store_id':s['id'],'name':body.name.strip(),'phone':body.phone,
-           'address':body.address,'slot':chosen_slot,'test_auto_time':auto_time,'items':items,'amount':amount,'created':time.time(),
+           'pickup_location':location,'pickup_area':area,'address':body.address,'slot':chosen_slot,'test_auto_time':auto_time,'items':items,'amount':amount,'created':time.time(),
            'status':'awaiting_payment','payment_status':'pending','payment_id':None,'payment_url':None,
            'saby_phase':'none','consent_at':time.time()}
         with connect() as c: c.execute('INSERT INTO orders VALUES(?,?,?,?)',(o['id'],uid,str(body.request_key),json.dumps(o,ensure_ascii=False)))
@@ -316,6 +384,9 @@ async def payment(oid:str,uid=Depends(user)):
     async with LOCK:
         o=owned(oid,uid)
         if o['payment_status']!='pending': return view(o)
+        if not o.get('payment_id'):
+            await check_pickup(o['store_id'],o.get('pickup_location'))
+            if o['amount']<minimum_amount(o['store_id']): raise HTTPException(409,'Сумма ниже минимума магазина. Создайте новый заказ.')
         if DEMO: return view(o)
         if o.get('test_auto_time') and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_')):
             raise HTTPException(409,'Этот заказ предназначен только для тестового магазина ЮKassa')
@@ -334,7 +405,10 @@ async def demo_pay(oid:str,uid=Depends(user)):
     if not DEMO: raise HTTPException(404)
     async with LOCK:
         o=owned(oid,uid)
-        if o['payment_status']=='pending': o.update(payment_status='succeeded',status='paid',saby_phase='queued');save(o)
+        if o['payment_status']=='pending':
+            await check_pickup(o['store_id'],o.get('pickup_location'))
+            if o['amount']<minimum_amount(o['store_id']): raise HTTPException(409,'Сумма ниже минимума магазина')
+            o.update(payment_status='succeeded',status='paid',saby_phase='queued');save(o)
     await tick()
     return view(owned(oid,uid))
 @app.post('/api/orders/{oid}/demo-next')

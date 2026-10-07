@@ -1,7 +1,7 @@
 'use strict';
 const $=id=>document.getElementById(id), tg=window.Telegram?.WebApp;
 tg?.ready();tg?.expand();
-const state={config:null,products:[],cart:{},category:'Все',order:null,requestKey:null,view:'tiles'};
+const state={config:null,products:[],cart:{},category:'Все',order:null,requestKey:null,view:'tiles',location:null,matches:[]};
 const money=n=>(n/100).toLocaleString('ru-RU',{maximumFractionDigits:2})+' ₽';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(s){$('toast').textContent=s;$('toast').style.display='block';clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>$('toast').style.display='none',5000)}
@@ -44,15 +44,18 @@ function renderCategories(){
  }
  $('categories').innerHTML=html;
 }
-function renderStores(){$('storeOptions').innerHTML=state.config.stores.map(s=>`<button class="storeoption ${s.id===$('store').value?'selected':''}" data-store="${esc(s.id)}"><strong>${esc(s.name)}</strong><small>${esc(s.address||'')}</small></button>`).join('')}
+function canPickup(sid){return !state.config.geo_required||state.matches.some(m=>m.store_id===sid)}
+function selectedMinimum(){return state.config.stores.find(s=>s.id===$('store').value)?.minimum_amount??120000}
+function renderLocation(){ $('nearby').hidden=!state.config.geo_required||state.config.catalog_only; $('locate').closest('.locationbox').hidden=!state.config.geo_required||state.config.catalog_only; $('locationStatus').textContent=state.location?('Сохранённая точка · точность '+Math.round(state.location.accuracy)+' м. '+(state.matches.length?'Доступно магазинов: '+state.matches.length:'Обслуживание пока не подтверждено.')):'Определите местоположение для проверки района обслуживания.'; $('clearLocation').hidden=!state.location; }
+function renderStores(){$('storeOptions').innerHTML=state.config.stores.map(s=>`<button class="storeoption ${s.id===$('store').value?'selected':''}" data-store="${esc(s.id)}" ${canPickup(s.id)?'':'disabled'}><strong>${esc(s.name)}</strong><small>${esc(s.address||'')}</small></button>`).join('')}
 function setView(view){state.view=view;const label=view==='tiles'?'Показать списком':'Показать плиткой';$('viewToggle').setAttribute('aria-label',label);$('viewToggle').setAttribute('title',label);$('viewToggle').innerHTML=view==='tiles'?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h1M3 12h1M3 18h1"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>';try{localStorage.setItem('catalogView',view)}catch{}render()}
 $('viewToggle').onclick=()=>setView(state.view==='tiles'?'list':'tiles');
-document.addEventListener('click',e=>{const b=e.target.closest('[data-store]');if(b){$('store').value=b.dataset.store;$('storePicker').open=false;run(loadStore)}else if(!e.target.closest('#storePicker'))$('storePicker').open=false});
+document.addEventListener('click',e=>{const b=e.target.closest('[data-store]');if(b){if(!canPickup(b.dataset.store))return; $('store').value=b.dataset.store;$('storePicker').open=false;run(loadStore)}else if(!e.target.closest('#storePicker'))$('storePicker').open=false});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')$('storePicker').open=false});
 
 let catalogLoad=0;
 async function loadStore(){const load=++catalogLoad;state.cart={};state.products=[];render();const sid=$('store').value,s=state.config.stores.find(s=>s.id===sid);$('storeAddress').textContent=s.address;$('storeName').textContent=s.name;renderStores();const products=await api('/catalog/'+encodeURIComponent(sid));if(load!==catalogLoad)return;state.products=products;for(const id of Object.keys(state.cart)){const p=state.products.find(p=>p.id===id);if(!p||p.stock===0)delete state.cart[id];else if(p.stock!==null)state.cart[id]=Math.min(state.cart[id],p.stock)}state.category='Все';state.requestKey=null;renderCategories();render()}
-function renderCart(){$('cartItems').innerHTML=state.products.filter(p=>state.cart[p.id]).map(p=>`<div class="cartitem"><div class="info">${esc(p.name)}<small>${quantity(p,state.cart[p.id])} · ${money(lineTotal(p,state.cart[p.id]))}</small></div>${stepper(p)}</div>`).join('');$('checkoutTotal').textContent=money(total());$('submitOrder').disabled=!count()||state.config.catalog_only}
+function renderCart(){$('cartItems').innerHTML=state.products.filter(p=>state.cart[p.id]).map(p=>`<div class="cartitem"><div class="info">${esc(p.name)}<small>${quantity(p,state.cart[p.id])} · ${money(lineTotal(p,state.cart[p.id]))}</small></div>${stepper(p)}</div>`).join('');$('checkoutTotal').textContent=money(total());$('minimumNotice').textContent=total()<selectedMinimum()?'Минимальный заказ — '+money(selectedMinimum())+'. Добавьте ещё на '+money(selectedMinimum()-total()):'Минимальный заказ — '+money(selectedMinimum());$('pickupNotice').textContent=canPickup($('store').value)?'':'Для оформления подтвердите местоположение в зоне магазина.';$('submitOrder').disabled=!count()||state.config.catalog_only||total()<selectedMinimum()||!canPickup($('store').value)}
 async function openCart(){renderCart();$('checkoutForm').hidden=state.config.catalog_only;$('catalogNotice').hidden=!state.config.catalog_only;if(state.config.catalog_only){$('cartDialog').showModal();return;}$('checkoutStore').textContent=state.config.stores.find(s=>s.id===$('store').value).name;const autoTime=!!state.config.test_auto_pickup_time;$('slotField').hidden=autoTime;$('slot').disabled=autoTime;$('slot').required=!autoTime;$('autoTimeNotice').hidden=!autoTime;if(autoTime){$('slot').innerHTML='';$('cartDialog').showModal();return;}$('slot').innerHTML='<option>Загружаем время…</option>';$('cartDialog').showModal();const times=await api('/slots/'+encodeURIComponent($('store').value));$('slot').innerHTML=times.map(t=>`<option value="${esc(t)}">${esc(t.slice(8,10)+'.'+t.slice(5,7)+' · '+t.slice(11,16))}</option>`).join('');if(!times.length){$('slot').innerHTML='<option value="">Нет доступного времени</option>';toast('Магазин пока не принимает заказы')}}
 async function listOrders(){const orders=await api('/orders');$('orderCount').textContent=orders.length||'';$('ordersList').innerHTML=orders.length?orders.map(o=>`<article class="ordercard" data-order="${o.id}"><span class="badge">${esc(o.status_label)}</span><h3>${esc(o.store)} · ${money(o.amount)}</h3><p>${esc(o.items.map(i=>i.name+' × '+(i.weighted?i.selection+' г':i.qty+' '+(i.unit||'шт'))).join(', '))}</p><small>${esc(o.slot)} · #${o.id.slice(0,8)} →</small></article>`).join(''):'<div class="empty">Здесь появятся ваши заказы.<br>Выберите что-нибудь в каталоге.</div>';show('ordersView')}
 async function openOrder(id){state.order=id;await refreshOrder();show('orderView')}
@@ -63,9 +66,26 @@ async function pay(){const b=$('payBtn');if(b)b.disabled=true;try{if(state.confi
 document.addEventListener('click',e=>{const product=e.target.closest('[data-product]');if(product)openProduct(product.dataset.product);const b=e.target.closest('[data-change]');if(b)modify(b.dataset.id,Number(b.dataset.change));const c=e.target.closest('[data-category]');if(c){state.category=c.dataset.category;renderCategories();render()}const o=e.target.closest('[data-order]');if(o)run(()=>openOrder(o.dataset.order))});
 $('closeProduct').onclick=()=>$('productDialog').close();
 $('cartBtn').onclick=()=>run(openCart);$('closeCart').onclick=()=>$('cartDialog').close();$('ordersBtn').onclick=()=>run(listOrders);$('backOrders').onclick=()=>run(listOrders);$('backShop').onclick=()=>show('shopView');$('search').oninput=render;$('store').onchange=()=>run(loadStore);$('privacyBtn').onclick=()=>$('privacyDialog').showModal();
-$('checkoutForm').onsubmit=e=>{e.preventDefault();run(async()=>{const b=$('submitOrder');b.disabled=true;try{state.requestKey??=crypto.randomUUID();let phone=$('phone').value.replace(/\D/g,'');if(phone.startsWith('8')&&phone.length===11)phone='7'+phone.slice(1);if(!/^7\d{10}$/.test(phone))throw Error('Введите телефон в формате +7 999 123-45-67');const o=await api('/orders',{store_id:$('store').value,name:$('name').value,phone:'+'+phone,address:$('address').value,slot:$('slot').value,items:Object.entries(state.cart).map(([id,qty])=>({id,qty})),request_key:state.requestKey,consent:$('consent').checked});state.cart={};state.requestKey=null;render();$('cartDialog').close();await openOrder(o.id);if(!state.config.demo)await pay()}finally{b.disabled=false}})};
+$('checkoutForm').onsubmit=e=>{e.preventDefault();run(async()=>{const b=$('submitOrder');b.disabled=true;try{if(!canPickup($('store').value))throw Error('Подтвердите местоположение');if(total()<selectedMinimum())throw Error('Сумма меньше минимального заказа');state.requestKey??=crypto.randomUUID();let phone=$('phone').value.replace(/\D/g,'');if(phone.startsWith('8')&&phone.length===11)phone='7'+phone.slice(1);if(!/^7\d{10}$/.test(phone))throw Error('Введите телефон в формате +7 999 123-45-67');const o=await api('/orders',{store_id:$('store').value,name:$('name').value,phone:'+'+phone,address:$('address').value,slot:$('slot').value,items:Object.entries(state.cart).map(([id,qty])=>({id,qty})),request_key:state.requestKey,consent:$('consent').checked});state.cart={};state.requestKey=null;render();$('cartDialog').close();await openOrder(o.id);if(!state.config.demo)await pay()}finally{renderCart()}})};
 $('chatForm').onsubmit=e=>{e.preventDefault();run(async()=>{const b=$('chatForm').querySelector('button');b.disabled=true;try{await api('/orders/'+state.order+'/messages',{text:$('chatText').value});$('chatText').value='';await refreshOrder();$('messages').scrollTop=$('messages').scrollHeight}finally{b.disabled=false}})};
-$('nearby').onclick=()=>{if(!navigator.geolocation)return toast('Выберите магазин вручную');navigator.geolocation.getCurrentPosition(pos=>run(async()=>{const {latitude,longitude}=pos.coords;const list=state.config.stores.filter(s=>Number.isFinite(s.lat)&&Number.isFinite(s.lon));if(!list.length)return toast('Координаты магазинов ещё не настроены');const dist=s=>(s.lat-latitude)**2+((s.lon-longitude)*Math.cos(latitude*Math.PI/180))**2;list.sort((a,b)=>dist(a)-dist(b));$('store').value=list[0].id;await loadStore();toast('Выбран ближайший магазин')}),()=>toast('Нет доступа к геолокации. Выберите магазин вручную'),{timeout:10000})};
+async function locate(){
+ if(!$('locationConsent').checked)return toast('Подтвердите сохранение местоположения');
+ if(!navigator.geolocation)return toast('Геолокация недоступна. Откройте приложение на телефоне и разрешите доступ.');
+ $('locate').disabled=true;
+ try{
+  await api('/pickup-profile/clear',{});state.location=null;state.matches=[];state.requestKey=null;renderLocation();renderStores();renderCart();
+  $('locationStatus').textContent='Определяем местоположение…';
+  const pos=await new Promise((resolve,reject)=>navigator.geolocation.getCurrentPosition(resolve,()=>reject(Error('Не удалось определить местоположение. Разрешите доступ и повторите.')),{enableHighAccuracy:true,timeout:20000,maximumAge:0}));
+  if(!Number.isFinite(pos.coords.accuracy)||pos.coords.accuracy>100)throw Error('Недостаточная точность. Включите точную геолокацию и повторите.');
+  $('locationStatus').textContent='Проверяем район обслуживания…';
+  const r=await api('/pickup-profile',{lat:pos.coords.latitude,lon:pos.coords.longitude,accuracy:pos.coords.accuracy,captured_at:pos.timestamp/1000,consent:true});
+  state.location=r.location;state.matches=r.matches;
+  if(!canPickup($('store').value)){$('store').value=r.matches[0].store_id;await loadStore();}
+ }finally{$('locate').disabled=false;renderLocation();renderStores();renderCart();}
+}
+$('locate').onclick=()=>run(locate);
+$('nearby').textContent='◎ Моя точка';$('nearby').onclick=()=>{$('locationConsent').scrollIntoView({behavior:'smooth',block:'center'});run(locate)};
+$('clearLocation').onclick=()=>run(async()=>{await api('/pickup-profile/clear',{});state.location=null;state.matches=[];state.requestKey=null;renderLocation();renderStores();renderCart()});
 async function boot(){
 state.config=await api('/config');try{setView(localStorage.getItem('catalogView')==='list'?'list':'tiles')}catch{}
 $('demo').hidden=!state.config.demo&&!state.config.catalog_only;
@@ -73,6 +93,7 @@ if(state.config.catalog_only){$('demo').textContent='Каталог Saby · оф
 if(!state.config.stores.length){$('products').innerHTML='';$('empty').hidden=false;$('empty').textContent='Загружаем каталог магазина. Страница обновится автоматически.';window.setTimeout(()=>run(boot),5000);return;}
 $('empty').textContent='Товары не найдены';
 $('store').innerHTML=state.config.stores.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');
+state.location=null;state.matches=[];try{const p=await api('/pickup-profile');state.location=p.location;state.matches=p.matches;if(p.matches.length)$('store').value=p.matches[0].store_id;}catch(e){toast(e.message)}renderLocation();
 if(tg?.initDataUnsafe?.user?.first_name)$('name').value=tg.initDataUnsafe.user.first_name;
 try{await loadStore()}catch(e){toast(e.message);window.setTimeout(()=>run(boot),5000);return;}const id=new URLSearchParams(location.search).get('order');if(id)await openOrder(id);
 }

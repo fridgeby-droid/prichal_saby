@@ -47,7 +47,7 @@ def test_catalog_mode_blocks_writes(monkeypatch):
     monkeypatch.setattr(s,'catalog',real_catalog)
     with TestClient(s.app) as c:
         assert c.get('/api/config').json()['catalog_only'] is True
-        assert c.get('/api/catalog/center').json()==[{'id':'real','name':'Из Saby','price':9900}]
+        assert c.get('/api/catalog/center').json()==[{'id':'real','name':'Из Saby','price':9900,'display_rank':1000000}]
         for url in ('/api/orders','/api/orders/x/demo-pay','/webhooks/yookassa','/webhooks/telegram'):
             assert c.post(url,json={}).status_code==403
         assert c.get('/api/orders').status_code==403
