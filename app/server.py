@@ -1,3 +1,4 @@
+from .pickup_hours import enabled as local_schedule, schedule as pickup_schedule
 import asyncio, contextlib, hashlib, hmac, json, logging, os, re, secrets, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -113,13 +114,20 @@ def demo_catalog(sid):
     return [{'id':a,'name':b,'price':c,'category':d,'icon':e,'unit':'шт','stock':20 if sid=='center' else 12,'saby':{'nomNumber':a}} for a,b,c,d,e in goods]
 async def catalog(s,checkout=False): return demo_catalog(s['id']) if DEMO else CACHE.products(s,checkout)
 def test_auto_time():
+    if local_schedule(): return False
     enabled=os.getenv('TEST_AUTO_PICKUP_TIME','false').lower()=='true'
     if enabled and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or
                     (not DEMO and not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_'))):
         raise RuntimeError('TEST_AUTO_PICKUP_TIME разрешён только с тестовым ключом ЮKassa и ALLOW_REAL_PAYMENTS=false')
     return enabled
 
+def require_pickup_open():
+    hours=pickup_schedule()
+    if not hours['accepting']: raise HTTPException(409,'Приём заказов закрыт. Откроемся '+hours['next_open']+' (время Перми)')
+    return hours['slot']
+
 async def slots(s):
+    if local_schedule(): return []
     if test_auto_time(): return []
     if not DEMO: return await SABY.slots(s)
     now=datetime.now(TZ); first=now.replace(second=0,microsecond=0)+timedelta(minutes=30-now.minute%30)
@@ -216,6 +224,7 @@ async def lifespan(app):
     for key,default in [('CATALOG_SYNC_SECONDS','300'),('CATALOG_MAX_AGE_SECONDS','900'),('PHOTO_REFRESH_SECONDS','86400'),('PHOTO_CACHE_MAX_MB','1024')]:
         if int(os.getenv(key,default))<=0: raise RuntimeError(key+': нужно положительное число')
     test_auto_time()
+    if local_schedule(): pickup_schedule()
     with database.single_worker():
         init_db()
         CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
@@ -227,7 +236,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.5.0',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал · Самовывоз',version='0.5.1',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -254,7 +263,7 @@ async def health():
     return {'ok':True,'mode':MODE,'database':'postgresql' if database.postgres() else 'sqlite','catalog_ready':bool(current_stores()) if not DEMO else True}
 
 @app.get('/api/config')
-async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'geo_required':geo_enabled(),'stores':[{**{k:s.get(k) for k in ('id','name','address','lat','lon')},'minimum_amount':minimum_amount(s['id'])} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
+async def config(): return {'demo':DEMO,'catalog_only':CATALOG_ONLY,'test_auto_pickup_time':test_auto_time(),'pickup_hours':pickup_schedule() if local_schedule() else None,'geo_required':geo_enabled(),'stores':[{**{k:s.get(k) for k in ('id','name','address','lat','lon')},'minimum_amount':minimum_amount(s['id'])} for s in current_stores()],'bot_username':os.getenv('BOT_USERNAME','')}
 @app.get('/api/catalog/{sid}')
 async def get_catalog(sid:str,uid=Depends(user)):
     # Ordered product IDs, optionally different for each store.
@@ -362,7 +371,8 @@ async def checkout(body:Checkout,uid=Depends(user)):
         s=store_for(body.store_id); location=profile(uid); area=await check_pickup(s['id'],location); products={p['id']:p for p in await catalog(s,checkout=True)}
         auto_time=test_auto_time()
         chosen_slot=(datetime.now(TZ)+timedelta(minutes=31)).replace(second=0,microsecond=0).strftime('%Y-%m-%d %H:%M:%S') if auto_time else body.slot
-        if not auto_time and chosen_slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
+        if local_schedule(): chosen_slot=require_pickup_open()
+        if not local_schedule() and not auto_time and chosen_slot not in await slots(s): raise HTTPException(409,'Время больше недоступно. Выберите другое')
         if len(set(i.id for i in body.items))!=len(body.items): raise HTTPException(400,'Повтор товара')
         items=[]
         for item in body.items:
@@ -387,10 +397,14 @@ async def payment(oid:str,uid=Depends(user)):
         if not o.get('payment_id'):
             await check_pickup(o['store_id'],o.get('pickup_location'))
             if o['amount']<minimum_amount(o['store_id']): raise HTTPException(409,'Сумма ниже минимума магазина. Создайте новый заказ.')
-        if DEMO: return view(o)
+        if DEMO:
+            if local_schedule(): require_pickup_open()
+            return view(o)
         if o.get('test_auto_time') and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_')):
             raise HTTPException(409,'Этот заказ предназначен только для тестового магазина ЮKassa')
         if not o.get('payment_id'):
+            if local_schedule():
+                o['slot']=require_pickup_open();save(o)
             if time.time()-o['created']>23*3600:
                 raise HTTPException(409,'Срок создания платежа истёк. Оформите новый заказ; при сомнениях обратитесь в поддержку')
             p=await YOO.create(o,BASE)
@@ -406,6 +420,7 @@ async def demo_pay(oid:str,uid=Depends(user)):
     async with LOCK:
         o=owned(oid,uid)
         if o['payment_status']=='pending':
+            if local_schedule(): o['slot']=require_pickup_open()
             await check_pickup(o['store_id'],o.get('pickup_location'))
             if o['amount']<minimum_amount(o['store_id']): raise HTTPException(409,'Сумма ниже минимума магазина')
             o.update(payment_status='succeeded',status='paid',saby_phase='queued');save(o)

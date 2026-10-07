@@ -11,3 +11,5 @@ os.environ.pop('DATABASE_URL', None)
 # Legacy checkout scenarios isolate the new geographic/minimum rules.
 os.environ['PICKUP_GEO_REQUIRED'] = 'false'
 os.environ['PICKUP_MINIMUM_RUB'] = '0'
+
+os.environ['PICKUP_LOCAL_SCHEDULE'] = 'false'
