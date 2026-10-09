@@ -17,7 +17,7 @@ const lineTotal=(p,q)=>Math.round(p.price*q/divisor(p));
 const priceLabel=p=>weighted(p)?money(p.price*100/divisor(p))+' / 100 г':money(p.price)+' / '+esc(p.unit);
 const available=p=>p.stock===null?((weighted(p)||p.volume)?30000:30):Math.min((weighted(p)||p.volume)?30000:30,Math.floor(p.stock*divisor(p)));
 const availabilityLabel=p=>available(p)>=minimum(p)?'В наличии':'Закончился';
-function photo(p){return p.images?.length?`<img src="${esc(p.images[0])}" alt="${esc(p.name)}" loading="lazy"><span class="imagefallback" hidden>Фото недоступно</span>`:`<span>${esc(p.icon||'◈')}</span>`}
+function photo(p){return p.images?.length?`<img src="${esc(p.images[0])}" alt="${esc(p.name)}" loading="lazy" decoding="async"><span class="imagefallback" hidden>Фото недоступно</span>`:`<span>${esc(p.icon||'◈')}</span>`}
 document.addEventListener('error',e=>{if(e.target.tagName==='IMG'){e.target.hidden=true;if(e.target.nextElementSibling)e.target.nextElementSibling.hidden=false}},true);
 function total(){return state.products.reduce((a,p)=>a+lineTotal(p,state.cart[p.id]||0),0)}
 function modify(id,n){const p=state.products.find(x=>x.id===id);if(!p)return;const old=state.cart[id]||0;let v=old?old+n*(p.step_qty||1):(n>0?minimum(p):0);if(v<minimum(p))v=0;if(v>available(p))return toast('Недостаточно товара в наличии');if(!v)delete state.cart[id];else state.cart[id]=v;state.requestKey=null;render();if($('cartDialog').open)renderCart();if($('productDialog').open)renderProduct(p)}

@@ -252,7 +252,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал',version='0.6.1',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал',version='0.6.2',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -298,7 +298,7 @@ async def product_image(key:str):
     if object_storage.enabled():
         meta,_=CACHE.read('photo-s3:'+key)
         if meta and meta.get('storage')==object_storage.identity():
-            return RedirectResponse(await asyncio.to_thread(object_storage.url,meta),status_code=307,headers={'Cache-Control':'no-store'})
+            return RedirectResponse(await asyncio.to_thread(object_storage.url,meta),status_code=307,headers={'Cache-Control':'private, max-age=1800'})
     photo=CACHE.local_photo(key)
     if not photo: raise HTTPException(404,'Фото пока не загружено')
     return FileResponse(photo[0],media_type=photo[1],headers={'Cache-Control':'public, max-age=3600'})
