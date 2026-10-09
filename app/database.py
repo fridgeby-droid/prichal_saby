@@ -1,5 +1,6 @@
 """Small portable DB layer. PostgreSQL in production, SQLite for local/demo use."""
 import os
+import base64
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,9 +27,17 @@ def pool():
             if url.startswith(prefix): url = 'postgresql://' + url[len(prefix):]
         if not url.startswith('postgresql://'):
             raise RuntimeError('DATABASE_URL должен быть адресом PostgreSQL')
+        tls = {}
+        if os.getenv('DATABASE_SSLMODE'): tls['sslmode']=os.environ['DATABASE_SSLMODE']
+        if os.getenv('DATABASE_SSL_CA_B64'):
+            pem=base64.b64decode(os.environ['DATABASE_SSL_CA_B64'],validate=True)
+            if b'-----BEGIN CERTIFICATE-----' not in pem: raise RuntimeError('Неверный сертификат PostgreSQL')
+            cert=Path(os.getenv('DB_PATH','/app/data/pickup.db')).parent/'timeweb-ca.crt'
+            cert.parent.mkdir(parents=True,exist_ok=True);cert.write_bytes(pem);cert.chmod(0o600)
+            tls['sslrootcert']=str(cert)
         _pool = ConnectionPool(url, min_size=1, max_size=5, timeout=10,
             kwargs={'row_factory': row_factory, 'connect_timeout': 10,
-                    'options': '-c statement_timeout=15000'}, open=True)
+                    'options': '-c statement_timeout=15000', **tls}, open=True)
         _pool.wait(timeout=15)
     return _pool
 
@@ -57,6 +66,8 @@ def init(path):
         f'CREATE TABLE IF NOT EXISTS messages(id {serial}, order_id TEXT, sender TEXT, text TEXT, created DOUBLE PRECISION)',
         f'CREATE TABLE IF NOT EXISTS outbox(id {serial}, chat TEXT, text TEXT, order_id TEXT, sent INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0)',
         'CREATE TABLE IF NOT EXISTS replies(chat TEXT, message_id BIGINT, order_id TEXT, PRIMARY KEY(chat,message_id))',
+        'CREATE TABLE IF NOT EXISTS support_topics(order_id TEXT PRIMARY KEY, chat TEXT NOT NULL, thread_id BIGINT, state TEXT NOT NULL, UNIQUE(chat,thread_id))',
+        f'CREATE TABLE IF NOT EXISTS support_audit(id {serial}, order_id TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT, text TEXT, created DOUBLE PRECISION)',
         'CREATE TABLE IF NOT EXISTS tg_updates(id BIGINT PRIMARY KEY)',
         'CREATE TABLE IF NOT EXISTS active_chats(user_id TEXT PRIMARY KEY,order_id TEXT)',
         'CREATE TABLE IF NOT EXISTS pickup_cache(key TEXT PRIMARY KEY, data TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL)',

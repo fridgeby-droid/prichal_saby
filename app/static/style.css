@@ -76,3 +76,5 @@
 #categories.chips{position:sticky;top:0;z-index:4;background:var(--paper);padding:10px 0 12px;border-bottom:1px solid var(--line);box-shadow:0 5px 8px -8px #123d3966}
 
 .locationbox{background:#fff;border:1px solid var(--line);border-radius:18px;padding:16px;margin:16px 0}.locationbox p{margin-top:0}.locationbox button{margin-top:8px}.storeoption:disabled{opacity:.45;cursor:not-allowed}
+
+.cart-hours{background:#edf2df;color:#123d39;border:1px solid #d7dfc5;border-radius:16px;padding:14px 16px;margin:0 0 18px}.cart-hours strong{font-size:17px}.cart-hours p{margin:6px 0 0;font-size:14px;line-height:1.45}

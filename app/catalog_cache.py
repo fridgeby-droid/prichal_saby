@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from .integrations import IntegrationError
+from . import object_storage
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,16 @@ class CatalogCache:
 
     async def save_photo(self, key, source):
         path = self.local_photo(key)
+        if object_storage.enabled():
+            meta,updated=self.read('photo-s3:'+key)
+            if meta and meta.get('storage')==object_storage.identity() and time.time()-updated<max(60,int(os.getenv('PHOTO_REFRESH_SECONDS','86400'))): return
+            # First transfer can reuse an already downloaded image; later refresh from Saby.
+            if path and (not meta or meta.get('storage')!=object_storage.identity()):
+                content,mime=path[0].read_bytes(),path[1]
+            else: content,mime=await self.saby.call('GET',source,binary=True)
+            meta=await asyncio.to_thread(object_storage.put,key,content,mime)
+            with self.connect() as c: self.write(c,'photo-s3:'+key,meta,time.time())
+            return
         ttl = max(60, int(os.getenv('PHOTO_REFRESH_SECONDS','86400')))
         if path and time.time()-path[0].stat().st_mtime < ttl: return
         content, mime = await self.saby.call('GET', source, binary=True)

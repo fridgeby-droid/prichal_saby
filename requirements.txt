@@ -2,6 +2,7 @@ fastapi==0.141.1
 uvicorn==0.54.0
 httpx==0.28.1
 python-dotenv==1.2.3
+boto3==1.43.109
 Pillow>=11.3,<13
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3

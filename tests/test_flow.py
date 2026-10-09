@@ -121,7 +121,7 @@ def test_saby_single_send_and_unknown_result(client,monkeypatch):
 
 def test_webhook_uses_provider_not_incoming_status(client,monkeypatch):
     o,_=new_order(client);stored=s.get_order(o['id']);stored['payment_id']='provider-test';s.save(stored)
-    async def get(pid):
+    async def get(pid,order=None):
         return {'id':pid,'metadata':{'order_id':o['id']},'amount':{'value':'298.00','currency':'RUB'},'test':True,'status':'pending'}
     monkeypatch.setattr(s.YOO,'get',get);monkeypatch.setattr(s,'DEMO',False)
     r=client.post('/webhooks/yookassa',json={'event':'payment.succeeded','object':{'id':'provider-test','status':'succeeded'}})

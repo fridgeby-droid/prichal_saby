@@ -10,6 +10,13 @@ async def main():
     sub=p.add_subparsers(dest='command',required=True)
     sub.add_parser('telegram-setup')
     sub.add_parser('attention')
+    sub.add_parser('support-check')
+    t=sub.add_parser('support-attach');t.add_argument('order_id');t.add_argument('thread_id',type=int)
+    t=sub.add_parser('support-reset');t.add_argument('order_id');t.add_argument('--confirmed-absent',action='store_true',required=True)
+    sub.add_parser('payments-check')
+    t=sub.add_parser('encode-ca');t.add_argument('path')
+    t=sub.add_parser('db-export');t.add_argument('path')
+    t=sub.add_parser('db-import');t.add_argument('path')
     t=sub.add_parser('order-diagnostics');t.add_argument('order_id')
     sub.add_parser('saby-points')
     sub.add_parser('saby-delivery-points')
@@ -26,7 +33,47 @@ async def main():
     t=sub.add_parser('attach-saby');t.add_argument('order_id');t.add_argument('external_id')
     t=sub.add_parser('retry-saby');t.add_argument('order_id');t.add_argument('--confirmed-absent',action='store_true',required=True)
     args=p.parse_args()
-    if args.command=='catalog-products':
+    if args.command=='encode-ca':
+        import base64
+        from pathlib import Path
+        pem=Path(args.path).read_bytes()
+        if b'-----BEGIN CERTIFICATE-----' not in pem: raise SystemExit('Файл не является PEM-сертификатом')
+        print(base64.b64encode(pem).decode())
+    elif args.command in ('db-export','db-import'):
+        from app.db_transfer import transfer
+        from app import database
+        database.init(s.DB)
+        print(json.dumps(transfer(s.connect,args.path,args.command.removeprefix('db-')),ensure_ascii=False))
+    elif args.command=='payments-check':
+        for sid in json.loads(os.getenv('SABY_STORE_PRICES','{}')):
+            try:
+                shop,key=s.YOO.credentials({'store_id':sid})
+                print(json.dumps({'point_id':sid,'shop_id':shop,'configured':True,'test_key':key.startswith('test_')},ensure_ascii=False))
+            except Exception: print(json.dumps({'point_id':sid,'configured':False}))
+    elif args.command=='support-check':
+        from app import support,database
+        database.init(s.DB)
+        chat=await telegram('getChat',{'chat_id':support.group()})
+        me=await telegram('getMe',{})
+        member=await telegram('getChatMember',{'chat_id':support.group(),'user_id':me['id']})
+        with s.connect() as c:
+            unresolved=[dict(r) for r in c.execute("SELECT order_id,chat,state FROM support_topics WHERE thread_id IS NULL")]
+            pending=c.execute("SELECT COUNT(*) FROM outbox WHERE sent=0 AND chat=?",(support.recipient(),)).fetchone()[0]
+        print(json.dumps({'group_id':chat['id'],'topics_enabled':chat.get('is_forum',False),'manage_topics':member.get('can_manage_topics',False),'unresolved_topics':unresolved,'pending_messages':pending},ensure_ascii=False,indent=2))
+    elif args.command in ('support-attach','support-reset'):
+        from app import support,database
+        database.init(s.DB);s.get_order(args.order_id)
+        # Run after stopping the application, like other manual reconciliation commands.
+        with database.single_worker():
+            with s.connect() as c:
+                if args.command=='support-attach':
+                    if args.thread_id<=0: raise SystemExit('Неверный ID темы')
+                    c.execute("INSERT INTO support_topics(order_id,chat,thread_id,state) VALUES(?,?,?,'open') ON CONFLICT(order_id) DO UPDATE SET chat=excluded.chat,thread_id=excluded.thread_id,state='open'",(args.order_id,support.group(),args.thread_id))
+                else:
+                    c.execute('DELETE FROM support_topics WHERE order_id=? AND thread_id IS NULL',(args.order_id,))
+                c.execute('UPDATE outbox SET attempts=0 WHERE order_id=? AND chat=? AND sent=0',(args.order_id,support.recipient()))
+        print('Сверка темы сохранена')
+    elif args.command=='catalog-products':
         from app import database
         database.init(s.DB)
         result=[]
@@ -38,6 +85,12 @@ async def main():
         from app import database
         database.init(s.DB)
         if args.command=='storage-check':
+            from app import object_storage
+            if object_storage.enabled():
+                result=await asyncio.to_thread(object_storage.probe)
+                with s.connect() as c: c.execute('SELECT 1').fetchone()
+                print(json.dumps({'database':'postgresql' if database.postgres() else 'sqlite',**result},ensure_ascii=False))
+                return
             s.CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
             probe=s.CACHE.photo_dir/('probe-'+uuid.uuid4().hex)
             try: probe.write_text('ok')
@@ -92,9 +145,12 @@ async def main():
                 else: result['status']='Saby не вернул поддерживаемую ссылку на фото'
                 print(json.dumps(result,ensure_ascii=False))
     elif args.command=='saby-check':
-        for store in await s.SABY.configured_stores():
-            goods=await s.SABY.catalog(store)
-            print(json.dumps({'store':store['name'],'point_id':store['point_id'],'price_list_id':store['price_list_id'],'products':len(goods),'sample':[{'name':p['name'],'price_rub':p['price']/100,'stock':p['stock']} for p in goods[:5]]},ensure_ascii=False,indent=2))
+        from app.diagnostics import catalog_checks
+        failures=0
+        async for result in catalog_checks(s.SABY):
+            print(json.dumps(result,ensure_ascii=False,indent=2),flush=True)
+            failures+=not result['ok']
+        if failures: raise SystemExit(1)
     elif args.command=='telegram-setup':
         assert s.BASE.startswith('https://'),'Нужен PUBLIC_URL с HTTPS'
         secret=os.environ['TELEGRAM_WEBHOOK_SECRET']

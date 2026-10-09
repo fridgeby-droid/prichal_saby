@@ -105,8 +105,14 @@ class Saby:
                     'withBalance':'true','noStopList':'true','pageSize':25,'order':'after'}
             if position is not None: params['position']=position
             result=await self.call('GET','v2/nomenclature/list',params=params)
-            batch=result if isinstance(result,list) else result.get('nomenclatures')
-            if not isinstance(batch,list): raise IntegrationError('Проверьте формат каталога Saby (nomenclatures)')
+            batch=result if isinstance(result,list) else result.get('nomenclatures') if isinstance(result,dict) else None
+            if not isinstance(batch,list):
+                shape={'point_id':store['point_id'],'price_list_id':store['price_list_id'],
+                       'response_type':type(result).__name__,'nomenclatures_type':type(batch).__name__,
+                       'nomenclatures_present':isinstance(result,dict) and 'nomenclatures' in result,
+                       'nomenclatures_count':len(batch) if isinstance(batch,(dict,str)) else None,
+                       'has_more':result.get('outcome',{}).get('hasMore') if isinstance(result,dict) and isinstance(result.get('outcome'),dict) else None}
+                raise IntegrationError('Не распознан каталог Saby: '+json.dumps(shape,ensure_ascii=False))
             if not batch: break
             for p in batch:
                 if p.get('isParent'):
@@ -173,9 +179,29 @@ class Saby:
         return await self.call('GET',f'order/{uuid.UUID(external_id)}/state')
 
 class YooKassa:
+    def credentials(self, order=None):
+        o=order or {}
+        account=o.get('payment_shop_id')
+        sid=str(o.get('store_id',''))
+        if account:
+            # Shop identity is immutable once a payment has been attempted.
+            candidates=[('YOOKASSA_SHOP_ID','YOOKASSA_SECRET_KEY'),
+                        ('YOOKASSA_SHOP_ID_'+sid,'YOOKASSA_SECRET_KEY_'+sid)]
+            candidates += [(k,k.replace('YOOKASSA_SHOP_ID_','YOOKASSA_SECRET_KEY_',1))
+                           for k in os.environ if k.startswith('YOOKASSA_SHOP_ID_')]
+            candidates += [('YOOKASSA_ARCHIVE_SHOP_ID_'+str(account),'YOOKASSA_ARCHIVE_SECRET_KEY_'+str(account))]
+            for shop,key in candidates:
+                if os.getenv(shop)==str(account) and os.getenv(key): return str(account),os.environ[key]
+            raise IntegrationError('Ключ исходной кассы заказа не настроен')
+        # Every new payment uses the shared account, regardless of store.
+        shop=os.getenv('YOOKASSA_SHOP_ID','').strip()
+        key=os.getenv('YOOKASSA_SECRET_KEY','').strip()
+        if not shop or not key: raise IntegrationError('Общий магазин ЮKassa не настроен')
+        return shop,key
+
     async def call(self, method, path, **kwargs):
-        binary=kwargs.pop("binary",False)
-        async with httpx.AsyncClient(timeout=25,auth=(os.getenv('YOOKASSA_SHOP_ID',''),os.getenv('YOOKASSA_SECRET_KEY',''))) as c:
+        order=kwargs.pop('order',None)
+        async with httpx.AsyncClient(timeout=25,auth=self.credentials(order)) as c:
             r=await c.request(method,'https://api.yookassa.ru/v3/'+path,**kwargs)
             r.raise_for_status()
             return r.json()
@@ -190,10 +216,10 @@ class YooKassa:
                  'vat_code':int(os.environ['RECEIPT_VAT_CODE']), 'payment_mode':'full_prepayment',
                  'payment_subject':'commodity'} for i in o['items']]}
             if os.getenv('RECEIPT_TAX_SYSTEM'): body['receipt']['tax_system_code']=int(os.environ['RECEIPT_TAX_SYSTEM'])
-        return await self.call('POST','payments',json=body,headers={'Idempotence-Key':o['id']})
-    async def get(self,payment_id):
+        return await self.call('POST','payments',order=o,json=body,headers={'Idempotence-Key':o['id']})
+    async def get(self,payment_id,order=None):
         if not payment_id or not all(c.isalnum() or c=='-' for c in payment_id): raise IntegrationError('Неверный ID платежа')
-        return await self.call('GET','payments/'+payment_id)
+        return await self.call('GET','payments/'+payment_id,order=order)
 
 async def telegram(method,body):
     token=os.getenv('BOT_TOKEN','')

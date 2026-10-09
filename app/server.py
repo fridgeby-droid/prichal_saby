@@ -6,10 +6,10 @@ from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
 from .pickup_rules import covers, minimum_amount
 from .products import line_item
-from . import database
+from . import database, object_storage, support
 from .catalog_cache import CatalogCache
 from .diagnostics import safe_error
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +25,7 @@ DB=Path(os.getenv('DB_PATH',str(ROOT/'data/app.db')))
 STORES=json.loads(Path(os.getenv('STORES_FILE',str(ROOT/'config/stores.json'))).read_text())
 SABY=Saby(); YOO=YooKassa(); LOCK=asyncio.Lock()
 LABELS={'awaiting_payment':'Ожидает оплаты','paid':'Оплачен · передаём магазину','accepted':'Принят магазином',
-        'collecting':'Собираем','ready':'Готов к самовывозу','completed':'Выдан','canceled':'Отменён',
+        'collecting':'Собираем','ready':'Готов','completed':'Выдан','canceled':'Отменён',
         'attention':'Оплачен · уточняем передачу магазину'}
 
 def connect(): return database.connect(DB)
@@ -77,7 +77,7 @@ def view(o):
     keys=('id','store_id','name','phone','address','slot','amount','status','payment_status','created','payment_url')
     d={k:o.get(k) for k in keys}; d['status_label']=LABELS[o['status']]
     d['store']=store_for(o['store_id'])['name']
-    d['items']=[{k:i.get(k) for k in ('id','name','qty','price','unit','selection','line_amount','weighted')} for i in o['items']]
+    d['items']=[{k:i.get(k) for k in ('id','name','qty','price','unit','selection','line_amount','weighted','volume')} for i in o['items']]
     return d
 
 async def user(request:Request):
@@ -123,7 +123,7 @@ def test_auto_time():
 
 def require_pickup_open():
     hours=pickup_schedule()
-    if not hours['accepting']: raise HTTPException(409,'Приём заказов закрыт. Откроемся '+hours['next_open']+' (время Перми)')
+    if not hours['accepting']: raise HTTPException(409,'Приём заказов закрыт. Откроемся '+hours['next_open']+' (время Пермское)')
     return hours['slot']
 
 async def slots(s):
@@ -136,6 +136,8 @@ async def slots(s):
 async def reconcile_payment(o,p):
     if p.get('id')!=o.get('payment_id') or p.get('metadata',{}).get('order_id')!=o['id']: raise HTTPException(400,'Платёж не соответствует заказу')
     if p.get('amount',{}).get('currency')!='RUB' or Decimal(p['amount']['value'])*100!=o['amount']: raise HTTPException(400,'Сумма платежа не соответствует заказу')
+    if o.get('payment_shop_id') and str(p.get('recipient',{}).get('account_id',''))!=str(o['payment_shop_id']):
+        raise HTTPException(400,'Касса платежа не соответствует заказу')
     if o.get('test_auto_time') and not p.get('test',False): raise HTTPException(409,'Этот заказ предназначен только для тестовой оплаты')
     if not p.get('test',False) and os.getenv('ALLOW_REAL_PAYMENTS')!='true': raise HTTPException(409,'Реальные платежи отключены')
     if o['payment_status']=='succeeded': return
@@ -149,7 +151,7 @@ async def tick():
     async with LOCK:
         for o in all_orders():
             if not DEMO and o['payment_status']=='pending' and o.get('payment_id'):
-                try: await reconcile_payment(o,await YOO.get(o['payment_id'])); o=get_order(o['id'])
+                try: await reconcile_payment(o,await YOO.get(o['payment_id'],o)); o=get_order(o['id'])
                 except Exception: continue
             if o.get('saby_phase')=='queued':
                 if DEMO:
@@ -170,7 +172,7 @@ async def tick():
                     o.update(saby_phase='uncertain',status='attention',saby_error=safe_error(exc,o),saby_attempt_at=time.time())
                     save(o)
                     logging.getLogger(__name__).warning('Saby order %s: %s',o['id'],json.dumps(o['saby_error'],ensure_ascii=False))
-                    queue(os.getenv('ADMIN_CHAT_ID'),f"Проверьте Saby: неопределённый результат передачи #{o['id']}. Автоповтор отключён, чтобы не создать дубль.",o['id'])
+                    queue(os.getenv('ADMIN_CHAT_ID'),f"Проверьте Saby: неопределённый результат передачи #{o['id']}.",o['id'])
                 else:
                     # Persist accepted external ID before sending notifications.
                     # A notification failure must never turn an accepted order into a retry.
@@ -189,11 +191,18 @@ async def tick():
         with connect() as c: jobs=c.execute('SELECT * FROM outbox WHERE sent=0 AND attempts<8 ORDER BY id LIMIT 10').fetchall()
         for job in jobs:
             try:
-                result=await telegram('sendMessage',{'chat_id':job['chat'],'text':job['text']})
+                chat=job['chat'];body={'chat_id':chat,'text':job['text']}
+                if chat.startswith('support:'):
+                    if chat!='support:'+support.group(): raise IntegrationError('Группа очереди отличается от настройки')
+                    o=get_order(job['order_id'])
+                    tid=await support.thread(connect,telegram,o,store_for(o['store_id'])['name'])
+                    chat=support.group();body.update(chat_id=chat,message_thread_id=tid)
+                result=await telegram('sendMessage',body)
                 with connect() as c:
                     c.execute('UPDATE outbox SET sent=1 WHERE id=?',(job['id'],))
-                    c.execute('INSERT INTO replies VALUES(?,?,?) ON CONFLICT(chat,message_id) DO UPDATE SET order_id=excluded.order_id',(job['chat'],result['message_id'],job['order_id']))
-            except Exception:
+                    c.execute('INSERT INTO replies VALUES(?,?,?) ON CONFLICT(chat,message_id) DO UPDATE SET order_id=excluded.order_id',(chat,result['message_id'],job['order_id']))
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Outbox %s: %s',job['id'],json.dumps(safe_error(exc),ensure_ascii=False))
                 with connect() as c: c.execute('UPDATE outbox SET attempts=attempts+1 WHERE id=?',(job['id'],))
 async def worker():
     while True:
@@ -219,12 +228,19 @@ async def lifespan(app):
         required=['BOT_TOKEN','TELEGRAM_WEBHOOK_SECRET','YOOKASSA_SHOP_ID','YOOKASSA_SECRET_KEY']
         if any(not os.getenv(k) for k in required): raise RuntimeError('Не заполнены параметры интеграции')
         if not BASE.startswith('https://'): raise RuntimeError('Для интеграции нужен PUBLIC_URL с HTTPS')
-        if not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_') and os.getenv('ALLOW_REAL_PAYMENTS')!='true': raise RuntimeError('Разрешён только тестовый ключ ЮKassa')
+        # A single shared account accepts payments for all stores.
+        if os.getenv('ALLOW_REAL_PAYMENTS')!='true' and not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_'):
+            raise RuntimeError('Разрешены только тестовые ключи ЮKassa')
         if os.getenv('ALLOW_REAL_PAYMENTS')=='true' and os.getenv('LIVE_ACCEPTANCE_CONFIRMED')!='true': raise RuntimeError('Сначала пройдите приёмку по README')
     for key,default in [('CATALOG_SYNC_SECONDS','300'),('CATALOG_MAX_AGE_SECONDS','900'),('PHOTO_REFRESH_SECONDS','86400'),('PHOTO_CACHE_MAX_MB','1024')]:
         if int(os.getenv(key,default))<=0: raise RuntimeError(key+': нужно положительное число')
     test_auto_time()
     if local_schedule(): pickup_schedule()
+    object_storage.validate()
+    if os.getenv('MAINTENANCE_MODE','false').lower()=='true':
+        database.init(DB)
+        yield
+        return
     with database.single_worker():
         init_db()
         CACHE.photo_dir.mkdir(parents=True,exist_ok=True)
@@ -236,10 +252,12 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал · Самовывоз',version='0.5.1',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал',version='0.6.1',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
+    if os.getenv('MAINTENANCE_MODE','false').lower()=='true' and request.url.path!='/health':
+        return JSONResponse({'detail':'Техническое обслуживание. Попробуйте позже.'},status_code=503)
     if CATALOG_ONLY and (request.url.path.startswith('/api/orders') or request.url.path.startswith('/webhooks/')):
         return JSONResponse({'detail':'Режим каталога: заказы и оплата ещё не подключены'},status_code=403)
     if int(request.headers.get('content-length','0') or 0)>100000: return JSONResponse({'detail':'Слишком большой запрос'},status_code=413)
@@ -276,6 +294,11 @@ async def get_catalog(sid:str,uid=Depends(user)):
     return [{**{k:v for k,v in p.items() if k!='saby'},'display_rank':ranks.get(str(p['id']),1000000)} for p in await catalog(store_for(sid))]
 @app.get('/api/product-image/{key}')
 async def product_image(key:str):
+    if not re.fullmatch('[a-f0-9]{64}',key): raise HTTPException(404)
+    if object_storage.enabled():
+        meta,_=CACHE.read('photo-s3:'+key)
+        if meta and meta.get('storage')==object_storage.identity():
+            return RedirectResponse(await asyncio.to_thread(object_storage.url,meta),status_code=307,headers={'Cache-Control':'no-store'})
     photo=CACHE.local_photo(key)
     if not photo: raise HTTPException(404,'Фото пока не загружено')
     return FileResponse(photo[0],media_type=photo[1],headers={'Cache-Control':'public, max-age=3600'})
@@ -400,13 +423,21 @@ async def payment(oid:str,uid=Depends(user)):
         if DEMO:
             if local_schedule(): require_pickup_open()
             return view(o)
-        if o.get('test_auto_time') and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or not os.getenv('YOOKASSA_SECRET_KEY','').startswith('test_')):
+        if not o.get('payment_id') and local_schedule(): require_pickup_open()
+        try: shop,key=YOO.credentials(o)
+        except IntegrationError:
+            if o.get('test_auto_time'): raise HTTPException(409,'Тестовая касса магазина не настроена')
+            raise
+        if o.get('test_auto_time') and (os.getenv('ALLOW_REAL_PAYMENTS')=='true' or not key.startswith('test_')):
             raise HTTPException(409,'Этот заказ предназначен только для тестового магазина ЮKassa')
         if not o.get('payment_id'):
             if local_schedule():
                 o['slot']=require_pickup_open();save(o)
             if time.time()-o['created']>23*3600:
                 raise HTTPException(409,'Срок создания платежа истёк. Оформите новый заказ; при сомнениях обратитесь в поддержку')
+            if not key.startswith('test_') and os.getenv('ALLOW_REAL_PAYMENTS')!='true':
+                raise HTTPException(409,'Реальные платежи отключены')
+            o['payment_shop_id']=shop;save(o)
             p=await YOO.create(o,BASE)
             o['payment_id']=p['id'];o['payment_url']=p['confirmation']['confirmation_url'];save(o)
         return view(o)
@@ -441,7 +472,7 @@ async def yoo_hook(request:Request):
     async with LOCK:
         o=next((o for o in all_orders() if o.get('payment_id')==pid and pid),None)
         if not o: return {'ok':True} # worker also reconciles: webhook may precede saving payment_id
-        await reconcile_payment(o,await YOO.get(pid)) # Never trust incoming paid flag.
+        await reconcile_payment(o,await YOO.get(pid,o)) # Never trust incoming paid flag.
     return {'ok':True}
 
 class Message(BaseModel): text:str=Field(min_length=1,max_length=2000)
@@ -454,7 +485,7 @@ async def message(oid:str,body:Message,uid=Depends(user)):
     o=owned(oid,uid);text=body.text.strip()
     if not text: raise HTTPException(400,'Введите сообщение')
     add_message(oid,'customer',text)
-    queue(store_for(o['store_id'])['chat_id'],f"Заказ #{oid[:8]} · {o['name']}\n{text}\nОтветьте на это сообщение.",oid)
+    queue(support.recipient() or store_for(o['store_id'])['chat_id'],f"Заказ #{oid[:8]} · {o['name']}\n{text}\nОтветьте на это сообщение.",oid)
     if DEMO: add_message(oid,'store','Демо-ответ магазина: сообщение получили. Здесь продавец сможет согласовать замену или время получения.')
     return {'ok':True}
 
@@ -486,9 +517,14 @@ async def tg_hook(request:Request):
                 if row and row[0]:
                     try:
                         o=owned(row[0],sender);add_message(o['id'],'customer',text)
-                        queue(store_for(o['store_id'])['chat_id'],f"Заказ #{o['id'][:8]}\n{text}\nОтветьте на сообщение.",o['id'])
+                        queue(support.recipient() or store_for(o['store_id'])['chat_id'],f"Заказ #{o['id'][:8]}\n{text}\nОтветьте на сообщение.",o['id'])
                     except HTTPException: pass
                 else: queue(chat,'Выберите заказ: /order ПОЛНЫЙ_НОМЕР или напишите из Mini App.','')
+        elif chat==support.group():
+            tid=m.get('message_thread_id')
+            if 'forum_topic_closed' in m or 'forum_topic_reopened' in m:
+                with connect() as c: c.execute('UPDATE support_topics SET state=? WHERE chat=? AND thread_id=?',('closed' if 'forum_topic_closed' in m else 'open',chat,tid))
+            if support.reply(connect,m,text,update_id): return {'ok':True}
         elif text:
             s=next((s for s in current_stores() if str(s.get('chat_id',''))==chat and sender in [str(x) for x in s.get('staff_ids',[])]),None)
             reply=m.get('reply_to_message',{}).get('message_id')
