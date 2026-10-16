@@ -76,8 +76,9 @@ def test_group_member_reply_routing_and_audit(db,monkeypatch):
         c.execute("INSERT INTO replies VALUES('-100123',23,'o')")
     m={'chat':{'id':-100123,'type':'supergroup'},'message_thread_id':7,'from':{'id':999,'first_name':'Иван'},'reply_to_message':{'message_id':23}}
     assert not support.reply(db,{**m,'message_thread_id':8},'wrong topic',1)
-    assert not support.reply(db,{**m,'reply_to_message':{}},'internal',1)
+    assert not support.reply(db,{**m,'message_thread_id':1},'general',1)
     assert not support.reply(db,{**m,'chat':{'id':-100124,'type':'supergroup'}},'wrong group',1)
+    assert support.reply(db,{**m,'reply_to_message':{}},'Ответ',1)
     assert support.reply(db,m,'Ответ',1)
     with db() as c:
         assert c.execute('SELECT text FROM messages').fetchone()[0]=='Ответ'
@@ -156,7 +157,8 @@ def test_forum_outbox_uses_thread_and_maps_real_group(db,monkeypatch):
     monkeypatch.setattr(s,'telegram',tg)
     s.queue(support.recipient(),'Вопрос','o')
     asyncio.run(s.tick())
-    assert calls[1]==('sendMessage',{'chat_id':'-100123','text':'Вопрос','message_thread_id':7})
+    assert 'Магазин:</b>' in calls[1][1]['text']
+    assert calls[2]==('sendMessage',{'chat_id':'-100123','text':'Вопрос','message_thread_id':7,'parse_mode':'HTML'})
     with db() as c:
         assert c.execute('SELECT chat FROM replies').fetchone()[0]=='-100123'
         assert c.execute('SELECT sent FROM outbox').fetchone()[0]==1

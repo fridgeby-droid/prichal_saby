@@ -196,7 +196,8 @@ async def tick():
                     if chat!='support:'+support.group(): raise IntegrationError('Группа очереди отличается от настройки')
                     o=get_order(job['order_id'])
                     tid=await support.thread(connect,telegram,o,store_for(o['store_id'])['name'])
-                    chat=support.group();body.update(chat_id=chat,message_thread_id=tid)
+                    await support.introduction(connect,telegram,o,store_for(o['store_id'])['name'],tid,LABELS.get(o.get('status'),'Уточняется'))
+                    chat=support.group();body.update(chat_id=chat,message_thread_id=tid,parse_mode='HTML')
                 result=await telegram('sendMessage',body)
                 with connect() as c:
                     c.execute('UPDATE outbox SET sent=1 WHERE id=?',(job['id'],))
@@ -252,7 +253,7 @@ async def lifespan(app):
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError): await task
 
-app=FastAPI(title='Причал',version='0.6.2',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='Причал',version='0.6.3',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory=ROOT/'app/static'),name='static')
 @app.middleware('http')
 async def limits(request,call_next):
@@ -485,7 +486,7 @@ async def message(oid:str,body:Message,uid=Depends(user)):
     o=owned(oid,uid);text=body.text.strip()
     if not text: raise HTTPException(400,'Введите сообщение')
     add_message(oid,'customer',text)
-    queue(support.recipient() or store_for(o['store_id'])['chat_id'],f"Заказ #{oid[:8]} · {o['name']}\n{text}\nОтветьте на это сообщение.",oid)
+    queue(support.recipient() or store_for(o['store_id'])['chat_id'],support.customer_text(o,text) if support.group() else f"Заказ #{oid[:8]}\n{text}\nОтветьте на это сообщение.",oid)
     if DEMO: add_message(oid,'store','Демо-ответ магазина: сообщение получили. Здесь продавец сможет согласовать замену или время получения.')
     return {'ok':True}
 
@@ -517,14 +518,14 @@ async def tg_hook(request:Request):
                 if row and row[0]:
                     try:
                         o=owned(row[0],sender);add_message(o['id'],'customer',text)
-                        queue(support.recipient() or store_for(o['store_id'])['chat_id'],f"Заказ #{o['id'][:8]}\n{text}\nОтветьте на сообщение.",o['id'])
+                        queue(support.recipient() or store_for(o['store_id'])['chat_id'],support.customer_text(o,text) if support.group() else f"Заказ #{o['id'][:8]}\n{text}\nОтветьте на сообщение.",o['id'])
                     except HTTPException: pass
                 else: queue(chat,'Выберите заказ: /order ПОЛНЫЙ_НОМЕР или напишите из Mini App.','')
         elif chat==support.group():
             tid=m.get('message_thread_id')
             if 'forum_topic_closed' in m or 'forum_topic_reopened' in m:
                 with connect() as c: c.execute('UPDATE support_topics SET state=? WHERE chat=? AND thread_id=?',('closed' if 'forum_topic_closed' in m else 'open',chat,tid))
-            if support.reply(connect,m,text,update_id): return {'ok':True}
+            if support.reply(connect,m,text,update_id,lambda o:store_for(o['store_id'])['name']): return {'ok':True}
         elif text:
             s=next((s for s in current_stores() if str(s.get('chat_id',''))==chat and sender in [str(x) for x in s.get('staff_ids',[])]),None)
             reply=m.get('reply_to_message',{}).get('message_id')
